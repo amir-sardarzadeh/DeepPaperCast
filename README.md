@@ -1,13 +1,8 @@
 # DeepPaperCast
-<<<<<<< HEAD
+
 
 Turn academic PDFs into a two-host AI podcast with detailed technical explanations, then export high-quality MP3 audio.
 
-## GitHub Repository Name
-
-Recommended repo name:
-
-`deeppapercast`
 
 ## GitHub Description (Short)
 
@@ -102,4 +97,3 @@ Generated files are moved into:
 - For Anthropic thinking mode, temperature adjustments are automatically handled for compatibility.
 =======
 Generate detailed two-host AI podcast episodes from research PDFs using online LLMs and TTS, like how NotebookLM works.
->>>>>>> bd965d4860fa0c434d0277d2e13b5077270ec0bb
