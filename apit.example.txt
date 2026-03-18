@@ -1,0 +1,11 @@
+# Writer / LLM API keys
+# Copy this file to apit.txt and fill one of the following.
+
+# If Company = "Claude"
+ANTHROPIC_API_KEY=your_anthropic_key_here
+
+# If Company = "OpenAI"
+# OPENAI_API_KEY=your_openai_key_here
+
+# Optional, if using OpenRouter for writing
+# OPENROUTER_API_KEY=your_openrouter_key_here

@@ -1,0 +1,28 @@
+# Virtual environments
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local secrets
+apit.txt
+apiv.txt
+
+# Logs
+logs/
+*.log
+
+# Generated audio artifacts
+*.mp3
+*.m4a
+
+# Generated inputs/transcripts/outputs
+*.pdf
+outputs/
+Why LLM-Centric Systems Underperform on/
+Towards 6G MIMO_ Massive Spatial Multiplexing,/
+
+# Optional local OS noise
+.DS_Store
+Thumbs.db
