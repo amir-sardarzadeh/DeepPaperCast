@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Tuple
 DETAIL_LEVEL = "High"
 Company = "Claude"
 Model = "claude-opus-4-6"
-API_FILE = "api.txt"
+API_FILE = "apit.txt"
 FINAL_ROOT = "Final"
 File = "Channel_Parameter_Estimation_and_Localization_for_Near-field_XL-MIMO_Communications.pdf"
 

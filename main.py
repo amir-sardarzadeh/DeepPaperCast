@@ -37,7 +37,8 @@ File = "Channel_Parameter_Estimation_and_Localization_for_Near-field_XL-MIMO_Com
 DETAIL_LEVEL = "High"
 Company = "Claude"
 Model = "claude-opus-4-6"
-API_FILE = "api.txt"
+API_WRITER_FILE = "apit.txt"
+API_VOICE_FILE = "apiv.txt"
 FINAL_ROOT = "Final"
 EXTENDED_THINKING_ALWAYS_ON = True
 
@@ -86,7 +87,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--detail-level", choices=["Default", "High"], default=DETAIL_LEVEL)
     parser.add_argument("--company", default=Company, help="OpenAI or Claude")
     parser.add_argument("--model", default=Model, help="Writer model id")
-    parser.add_argument("--api-file", default=API_FILE, help="Path to api.txt")
+    parser.add_argument("--api-writer-file", default=API_WRITER_FILE, help="Path to writer API keys file (apit.txt)")
+    parser.add_argument("--api-voice-file", default=API_VOICE_FILE, help="Path to voice API keys file (apiv.txt)")
     parser.add_argument("--final-root", default=FINAL_ROOT, help="Master output root folder")
     parser.add_argument("--llm-base-url", default=None, help="Optional OpenAI-compatible base URL")
     parser.add_argument("--temperature", type=float, default=0.7)
@@ -222,7 +224,8 @@ def run() -> int:
 
     try:
         pdf_path = _resolve_pdf_path(args.pdf, root_dir)
-        api_file = Path(args.api_file).expanduser().resolve()
+        api_writer_file = Path(args.api_writer_file).expanduser().resolve()
+        api_voice_file = Path(args.api_voice_file).expanduser().resolve()
         final_root = Path(args.final_root).expanduser()
         if not final_root.is_absolute():
             final_root = (root_dir / final_root).resolve()
@@ -248,8 +251,12 @@ def run() -> int:
             shutil.copy2(pdf_path, copied_pdf)
             logger.info("Copied source PDF to: %s", copied_pdf)
 
-        api_keys = load_api_keys(api_file)
-        logger.info("Loaded API services: %s", ", ".join(sorted(api_keys.keys())))
+        writer_api_keys = load_api_keys(api_writer_file)
+        voice_api_keys = load_api_keys(api_voice_file)
+        logger.info("Writer API file: %s", api_writer_file)
+        logger.info("Voice API file: %s", api_voice_file)
+        logger.info("Loaded writer API services: %s", ", ".join(sorted(writer_api_keys.keys())))
+        logger.info("Loaded voice API services: %s", ", ".join(sorted(voice_api_keys.keys())))
 
         profile = _lookup_model_profile(model, provider)
         context_window = int(profile["max_context_tokens"])
@@ -283,7 +290,7 @@ def run() -> int:
             paper_name=paper_name,
             paper_text=text,
             output_dir=paper_dir,
-            api_keys=api_keys,
+            api_keys=writer_api_keys,
             llm_provider=provider,
             llm_model=model,
             llm_base_url=args.llm_base_url,
@@ -304,7 +311,7 @@ def run() -> int:
 
         audio_path = synthesize_audio_from_dialogue(
             dialogue_path=dialogue_path,
-            api_keys=api_keys,
+            api_keys=voice_api_keys,
             tts_model=args.tts_model,
             host_a_voice=args.host_a_voice,
             host_b_voice=args.host_b_voice,

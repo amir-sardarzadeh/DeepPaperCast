@@ -16,7 +16,7 @@ from typing import Dict, List, Optional
 DETAIL_LEVEL = "High"
 Company = "Claude"
 Model = "claude-sonnet-4-6"
-API_FILE = "api.txt"
+API_FILE = "apit.txt"
 FINAL_ROOT = "Final"
 File = "3.pdf"
 

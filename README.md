@@ -44,18 +44,26 @@ Install Python packages:
 python -m pip install -r requirements.txt
 ```
 
-## API Keys (`api.txt`)
+## API Keys (`apit.txt` + `apiv.txt`)
 
-Create `api.txt` in project root:
+Create these files in project root:
 
 ```txt
+# apit.txt (text generation)
 ANTHROPIC_API_KEY=your_anthropic_key
+OPENAI_API_KEY=your_openai_key_if_using_openai_writer
+```
+
+```txt
+# apiv.txt (voice generation)
 OPENAI_API_KEY=your_openai_key
 ```
 
 Notes:
-- Anthropic key is used for writing (`main.py`, `script_only.py`, `latex.py` when using Claude)
-- OpenAI key is used for TTS (`main.py` / `tts_audio.py`) and OpenAI writer models
+- `main.py` uses:
+  - `apit.txt` for writer (`llm_writer.py`)
+  - `apiv.txt` for voice (`tts_audio.py`)
+- `script_only.py` and `latex.py` are text-only and default to `apit.txt`.
 
 ## Quick Start
 
