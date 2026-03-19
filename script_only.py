@@ -1,12 +1,31 @@
 ﻿#!/usr/bin/env python3
-"""LLM + PDF utilities for dialogue and explanation generation."""
+"""Standalone transcript generator (no TTS, no dependency on llm_writer.py)."""
 
 from __future__ import annotations
 
+import argparse
 import logging
 import re
+import shutil
+import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+
+# Quick-start config (edit then run: python script_only.py)
+DETAIL_LEVEL = "High"
+Company = "Claude"
+Model = "claude-opus-4-6"
+API_FILE = "api.txt"
+FINAL_ROOT = "Final"
+File = "Channel_Parameter_Estimation_and_Localization_for_Near-field_XL-MIMO_Communications.pdf"
+
+SUPPORTED_MODELS = {
+    "claude-3-7-sonnet-latest": {"provider": "anthropic", "max_context_tokens": 200_000, "supports_extended_thinking": True},
+    "claude-opus-4-6": {"provider": "anthropic", "max_context_tokens": 200_000, "supports_extended_thinking": True},
+    "claude-sonnet-4-6": {"provider": "anthropic", "max_context_tokens": 200_000, "supports_extended_thinking": True},
+    "gpt-4o": {"provider": "openai", "max_context_tokens": 128_000, "supports_extended_thinking": False},
+    "gpt-4o-latest": {"provider": "openai", "max_context_tokens": 128_000, "supports_extended_thinking": False},
+}
 
 DEFAULT_DIALOGUE_SYSTEM_PROMPT = """You are a world-class podcast producer and scriptwriter.
 Write a lively, engaging two-person podcast transcript between Host A and Host B about the provided academic paper.
@@ -49,14 +68,52 @@ INVALID_FILENAME_CHARS = re.compile(r"[<>:\"/\\|?*\x00-\x1F]")
 ANTHROPIC_STREAMING_MAX_TOKENS_THRESHOLD = 21333
 
 
-class LLMWriterError(RuntimeError):
-    """Raised when PDF parsing or LLM generation fails."""
+class ScriptOnlyError(RuntimeError):
+    """Raised for script_only processing failures."""
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate podcast transcript only.")
+    parser.add_argument("--pdf", default=File, help="Input PDF path")
+    parser.add_argument("--detail-level", choices=["Default", "High"], default=DETAIL_LEVEL)
+    parser.add_argument("--company", default=Company)
+    parser.add_argument("--model", default=Model)
+    parser.add_argument("--api-file", default=API_FILE)
+    parser.add_argument("--final-root", default=FINAL_ROOT)
+    parser.add_argument("--llm-base-url", default=None)
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--dialogue-turns", type=int, default=48)
+    parser.add_argument("--max-input-chars", type=int, default=300000)
+    parser.add_argument("--chunk-size", type=int, default=12000)
+    parser.add_argument("--max-output-tokens", type=int, default=None)
+    parser.add_argument("--thinking-budget", type=int, default=None)
+    return parser.parse_args()
+
+
+def setup_logger(log_path: Path) -> logging.Logger:
+    logger = logging.getLogger("script_only")
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+    logger.propagate = False
+
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+
+    stream = logging.StreamHandler(sys.stdout)
+    stream.setLevel(logging.INFO)
+    stream.setFormatter(formatter)
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+
+    logger.addHandler(stream)
+    logger.addHandler(file_handler)
+    return logger
 
 
 def load_api_keys(api_file: Path) -> Dict[str, str]:
-    """Load API keys from api.txt style KEY=VALUE lines."""
     if not api_file.exists():
-        raise LLMWriterError(f"API key file not found: {api_file}")
+        raise ScriptOnlyError(f"API key file not found: {api_file}")
 
     keys: Dict[str, str] = {}
     for line_no, raw_line in enumerate(api_file.read_text(encoding="utf-8").splitlines(), start=1):
@@ -64,42 +121,46 @@ def load_api_keys(api_file: Path) -> Dict[str, str]:
         if not line or line.startswith("#"):
             continue
         if "=" not in line:
-            raise LLMWriterError(f"Malformed line {line_no} in {api_file.name}: {line}")
+            raise ScriptOnlyError(f"Malformed line {line_no} in {api_file.name}: {line}")
         key, value = line.split("=", 1)
         key = key.strip().upper()
         value = value.strip()
         if not key or not value:
-            raise LLMWriterError(f"Malformed line {line_no} in {api_file.name}: {line}")
+            raise ScriptOnlyError(f"Malformed line {line_no} in {api_file.name}: {line}")
         keys[key] = value
     return keys
 
 
+def _get_api_key(api_keys: Dict[str, str], aliases: List[str]) -> str:
+    for alias in aliases:
+        value = api_keys.get(alias.upper(), "").strip()
+        if value:
+            return value
+    raise ScriptOnlyError(f"Missing API key. Expected one of: {', '.join(aliases)}")
+
+
 def sanitize_name(name: str) -> str:
-    """Sanitize string for filesystem-safe folder/file names."""
     cleaned = INVALID_FILENAME_CHARS.sub("_", name)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
     return cleaned or "paper"
 
 
 def extract_pdf_text(pdf_path: Path, logger: logging.Logger) -> tuple[Optional[str], str]:
-    """Extract title and text from PDF with pypdf and pdfplumber fallback."""
     if not pdf_path.exists():
-        raise LLMWriterError(f"PDF not found: {pdf_path}")
+        raise ScriptOnlyError(f"PDF not found: {pdf_path}")
     if pdf_path.suffix.lower() != ".pdf":
-        raise LLMWriterError(f"Input is not a PDF: {pdf_path}")
+        raise ScriptOnlyError(f"Input is not a PDF: {pdf_path}")
 
     title: Optional[str] = None
     text = ""
-
     try:
         from pypdf import PdfReader
 
-        logger.info("Extracting PDF text with pypdf: %s", pdf_path)
+        logger.info("Extracting text with pypdf: %s", pdf_path)
         reader = PdfReader(str(pdf_path))
         if reader.metadata and getattr(reader.metadata, "title", None):
             title = str(reader.metadata.title).strip() or None
         text = "\n".join((page.extract_text() or "") for page in reader.pages).strip()
-        logger.info("pypdf extraction complete. chars=%d", len(text))
     except Exception as exc:  # noqa: BLE001
         logger.warning("pypdf extraction failed: %s", exc)
 
@@ -112,17 +173,15 @@ def extract_pdf_text(pdf_path: Path, logger: logging.Logger) -> tuple[Optional[s
                 alt = "\n".join((page.extract_text() or "") for page in pdf.pages).strip()
             if len(alt) > len(text):
                 text = alt
-            logger.info("pdfplumber extraction complete. chars=%d", len(text))
         except Exception as exc:  # noqa: BLE001
             logger.warning("pdfplumber extraction failed: %s", exc)
 
     if not text:
-        raise LLMWriterError("Failed to extract readable text from PDF.")
+        raise ScriptOnlyError("Failed to extract readable text from PDF.")
     return title, text
 
 
 def choose_paper_name(pdf_path: Path, extracted_title: Optional[str], text: str) -> str:
-    """Choose paper title for file/folder naming."""
     if extracted_title:
         lowered = extracted_title.lower().strip()
         if lowered not in {"untitled", "document", "microsoft word -"}:
@@ -136,22 +195,57 @@ def choose_paper_name(pdf_path: Path, extracted_title: Optional[str], text: str)
 
 
 def estimate_tokens_from_text(text: str, model_name: str) -> int:
-    """Estimate token count using tiktoken when available, with char fallback."""
     try:
         import tiktoken
 
         try:
-            encoder = tiktoken.encoding_for_model(model_name)
+            enc = tiktoken.encoding_for_model(model_name)
         except Exception:  # noqa: BLE001
-            encoder = tiktoken.get_encoding("cl100k_base")
-        return len(encoder.encode(text))
+            enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(text))
     except Exception:  # noqa: BLE001
         return max(1, len(text) // 4)
 
 
-class BaseLLMClient:
-    """Base LLM client interface."""
+def _resolve_provider(company: str) -> str:
+    value = (company or "").strip().lower()
+    if "claude" in value or "anthropic" in value:
+        return "anthropic"
+    if "openai" in value or "gpt" in value or "chatgpt" in value:
+        return "openai"
+    raise ScriptOnlyError("Company must be OpenAI or Claude.")
 
+
+def _lookup_model_profile(model_name: str, provider: str) -> Dict[str, object]:
+    for key, value in SUPPORTED_MODELS.items():
+        if key.lower() == model_name.lower():
+            return value
+    return {
+        "provider": provider,
+        "max_context_tokens": 200_000 if provider == "anthropic" else 128_000,
+        "supports_extended_thinking": provider == "anthropic",
+    }
+
+
+def calculate_dynamic_budgets(
+    *,
+    input_tokens: int,
+    context_window: int,
+    detail_level: str,
+    supports_extended_thinking: bool,
+) -> Tuple[int, int]:
+    safety_margin = max(1500, int(context_window * 0.03))
+    available = max(1024, context_window - input_tokens - safety_margin)
+    if detail_level.lower() == "high":
+        max_output = available
+        thinking = available if supports_extended_thinking else 0
+    else:
+        max_output = max(1024, min(8192, available))
+        thinking = min(max_output // 2, 8000) if supports_extended_thinking else 0
+    return max_output, thinking
+
+
+class BaseLLMClient:
     def generate_text(
         self,
         *,
@@ -162,18 +256,15 @@ class BaseLLMClient:
         thinking_budget_tokens: int,
         enable_extended_thinking: bool,
     ) -> str:
-        """Generate text response."""
         raise NotImplementedError
 
 
 class OpenAIResponsesClient(BaseLLMClient):
-    """OpenAI Responses API wrapper."""
-
     def __init__(self, *, model: str, api_key: str, base_url: Optional[str], logger: logging.Logger) -> None:
         try:
             from openai import OpenAI
         except ImportError as exc:
-            raise LLMWriterError("Missing dependency 'openai'. Install requirements.txt.") from exc
+            raise ScriptOnlyError("Missing dependency 'openai'. Install requirements.txt.") from exc
 
         kwargs = {"api_key": api_key}
         if base_url:
@@ -199,47 +290,44 @@ class OpenAIResponsesClient(BaseLLMClient):
             "max_output_tokens": max_output_tokens,
             "temperature": temperature,
         }
-        self.logger.info("Calling OpenAI Responses API. model=%s", self.model)
         try:
-            response = self.client.responses.create(**payload)
+            resp = self.client.responses.create(**payload)
         except Exception as exc:  # noqa: BLE001
             if "temperature" in str(exc).lower():
                 payload.pop("temperature", None)
-                response = self.client.responses.create(**payload)
+                resp = self.client.responses.create(**payload)
             else:
-                raise LLMWriterError(f"OpenAI API error: {exc}") from exc
+                raise ScriptOnlyError(f"OpenAI API error: {exc}") from exc
 
-        text = getattr(response, "output_text", None)
+        text = getattr(resp, "output_text", None)
         if text:
             return text.strip()
-        recovered = _recover_openai_response_text(response)
-        if recovered:
-            return recovered.strip()
-        raise LLMWriterError("OpenAI response did not contain readable text.")
+        out = getattr(resp, "output", None) or []
+        parts: List[str] = []
+        for item in out:
+            if getattr(item, "type", None) == "message":
+                for content in getattr(item, "content", []):
+                    ctype = getattr(content, "type", None)
+                    if ctype in {"output_text", "text"} and getattr(content, "text", None):
+                        parts.append(content.text)
+        if parts:
+            return "\n".join(parts).strip()
+        raise ScriptOnlyError("OpenAI response did not include readable text.")
 
 
 class AnthropicMessagesClient(BaseLLMClient):
-    """Anthropic Messages API wrapper with automatic streaming for large calls."""
-
     def __init__(self, *, model: str, api_key: str, logger: logging.Logger) -> None:
         try:
             import anthropic
         except ImportError as exc:
-            raise LLMWriterError("Missing dependency 'anthropic'. Install requirements.txt.") from exc
-
+            raise ScriptOnlyError("Missing dependency 'anthropic'. Install requirements.txt.") from exc
         self.client = anthropic.Anthropic(api_key=api_key)
         self.model = model
         self.logger = logger
 
-    @staticmethod
-    def _is_streaming_required_error(exc: Exception) -> bool:
-        return "streaming is required" in str(exc).lower()
-
-    def _send(self, payload: Dict[str, object], force_stream: bool = False) -> object:
+    def _send(self, payload: Dict[str, object]) -> object:
         max_tokens = int(payload.get("max_tokens", 0) or 0)
-        use_stream = force_stream or max_tokens >= ANTHROPIC_STREAMING_MAX_TOKENS_THRESHOLD
-        if use_stream:
-            self.logger.info("Using Anthropic streaming API. max_tokens=%d", max_tokens)
+        if max_tokens >= ANTHROPIC_STREAMING_MAX_TOKENS_THRESHOLD:
             with self.client.messages.stream(**payload) as stream:
                 return stream.get_final_message()
         return self.client.messages.create(**payload)
@@ -260,73 +348,34 @@ class AnthropicMessagesClient(BaseLLMClient):
             "messages": [{"role": "user", "content": user_prompt}],
             "max_tokens": max_output_tokens,
         }
-
-        use_thinking = enable_extended_thinking and thinking_budget_tokens > 0
-        if use_thinking:
+        if enable_extended_thinking and thinking_budget_tokens > 0:
             payload["thinking"] = {"type": "enabled", "budget_tokens": int(thinking_budget_tokens)}
-            if temperature != 1.0:
-                self.logger.warning(
-                    "Ignoring temperature=%s because Anthropic thinking mode is incompatible with custom temperature.",
-                    temperature,
-                )
         else:
             payload["temperature"] = temperature
 
-        self.logger.info("Calling Anthropic Messages API. model=%s", self.model)
         try:
             message = self._send(payload)
         except Exception as exc:  # noqa: BLE001
             if "thinking" in payload:
-                self.logger.warning("Anthropic thinking request failed (%s). Retrying without thinking.", exc)
                 payload.pop("thinking", None)
                 payload["temperature"] = temperature
                 try:
                     message = self._send(payload)
                 except Exception as retry_exc:  # noqa: BLE001
-                    raise LLMWriterError(f"Anthropic API error: {retry_exc}") from retry_exc
-            elif self._is_streaming_required_error(exc):
-                try:
-                    message = self._send(payload, force_stream=True)
-                except Exception as stream_exc:  # noqa: BLE001
-                    raise LLMWriterError(f"Anthropic API error: {stream_exc}") from stream_exc
+                    raise ScriptOnlyError(f"Anthropic API error: {retry_exc}") from retry_exc
             else:
-                raise LLMWriterError(f"Anthropic API error: {exc}") from exc
+                raise ScriptOnlyError(f"Anthropic API error: {exc}") from exc
 
-        text_blocks: List[str] = []
+        parts: List[str] = []
         for block in getattr(message, "content", []):
             if getattr(block, "type", None) == "text" and getattr(block, "text", None):
-                text_blocks.append(block.text)
-        if text_blocks:
-            return "\n".join(text_blocks).strip()
-        raise LLMWriterError("Anthropic response did not include readable text.")
+                parts.append(block.text)
+        if parts:
+            return "\n".join(parts).strip()
+        raise ScriptOnlyError("Anthropic response did not include readable text.")
 
 
-def _recover_openai_response_text(response: object) -> str:
-    """Recover text from lower-level OpenAI response structure."""
-    parts: List[str] = []
-    output = getattr(response, "output", None)
-    if not output:
-        return ""
-    for item in output:
-        if getattr(item, "type", None) == "message":
-            for content in getattr(item, "content", []):
-                ctype = getattr(content, "type", None)
-                if ctype in {"output_text", "text"} and getattr(content, "text", None):
-                    parts.append(content.text)
-        elif getattr(item, "text", None):
-            parts.append(item.text)
-    return "\n".join(parts).strip()
-
-
-def _get_api_key(api_keys: Dict[str, str], aliases: List[str]) -> str:
-    for alias in aliases:
-        value = api_keys.get(alias.upper(), "").strip()
-        if value:
-            return value
-    raise LLMWriterError(f"Missing API key. Expected one of: {', '.join(aliases)}")
-
-
-def _build_llm_client(
+def build_llm_client(
     *,
     provider: str,
     model: str,
@@ -348,13 +397,12 @@ def _build_llm_client(
             api_key=_get_api_key(api_keys, ["ANTHROPIC_API_KEY", "ANTHROPIC"]),
             logger=logger,
         )
-    raise LLMWriterError(f"Unsupported LLM provider: {provider}")
+    raise ScriptOnlyError(f"Unsupported provider: {provider}")
 
 
 def _split_long_block(text: str, max_chars: int) -> List[str]:
-    """Split long text preserving sentence boundaries when possible."""
     sentences = re.split(r"(?<=[.!?])\s+", text)
-    chunks: List[str] = []
+    out: List[str] = []
     current = ""
     for sentence in sentences:
         sentence = sentence.strip()
@@ -362,7 +410,7 @@ def _split_long_block(text: str, max_chars: int) -> List[str]:
             continue
         if len(sentence) > max_chars:
             if current:
-                chunks.append(current)
+                out.append(current)
                 current = ""
             words = sentence.split()
             bucket: List[str] = []
@@ -370,25 +418,24 @@ def _split_long_block(text: str, max_chars: int) -> List[str]:
             for word in words:
                 add = len(word) + (1 if bucket else 0)
                 if size + add > max_chars and bucket:
-                    chunks.append(" ".join(bucket))
+                    out.append(" ".join(bucket))
                     bucket = [word]
                     size = len(word)
                 else:
                     bucket.append(word)
                     size += add
             if bucket:
-                chunks.append(" ".join(bucket))
+                out.append(" ".join(bucket))
             continue
-
         candidate = f"{current} {sentence}".strip() if current else sentence
         if len(candidate) > max_chars and current:
-            chunks.append(current)
+            out.append(current)
             current = sentence
         else:
             current = candidate
     if current:
-        chunks.append(current)
-    return chunks
+        out.append(current)
+    return out
 
 
 def maybe_summarize_long_text(
@@ -397,9 +444,7 @@ def maybe_summarize_long_text(
     text: str,
     max_input_chars: int,
     chunk_size: int,
-    logger: logging.Logger,
 ) -> str:
-    """Chunk-summarize very long text to avoid context overflow."""
     if len(text) <= max_input_chars:
         return text
 
@@ -425,7 +470,6 @@ def maybe_summarize_long_text(
     if cur:
         chunks.append("\n\n".join(cur))
 
-    logger.info("Input text too long (%d chars). Summarizing %d chunks.", len(text), len(chunks))
     summaries: List[str] = []
     for idx, chunk in enumerate(chunks, start=1):
         summary = llm_client.generate_text(
@@ -440,8 +484,7 @@ def maybe_summarize_long_text(
     return "\n\n".join(summaries)
 
 
-def _normalize_dialogue(raw: str) -> List[str]:
-    """Normalize LLM output into strict Host A/B lines."""
+def normalize_dialogue(raw: str) -> List[str]:
     lines: List[str] = []
     for raw_line in raw.splitlines():
         line = raw_line.strip()
@@ -456,137 +499,106 @@ def _normalize_dialogue(raw: str) -> List[str]:
         elif lines:
             lines[-1] = f"{lines[-1]} {line}".strip()
     if not lines:
-        raise LLMWriterError("No parseable Host A / Host B lines were produced by the LLM.")
+        raise ScriptOnlyError("LLM did not return parseable Host A / Host B lines.")
     return lines
 
 
-def generate_dialogue_text(
-    *,
-    paper_name: str,
-    paper_text: str,
-    api_keys: Dict[str, str],
-    llm_provider: str,
-    llm_model: str,
-    llm_base_url: Optional[str],
-    detail_level: str,
-    max_output_tokens: int,
-    thinking_budget_tokens: int,
-    dialogue_turns: int,
-    temperature: float,
-    max_input_chars: int,
-    chunk_size: int,
-    logger: logging.Logger,
-) -> str:
-    """Generate normalized Host A/B dialogue text."""
-    detail = detail_level.strip().lower()
-    if detail not in {"default", "high"}:
-        raise LLMWriterError("DETAIL_LEVEL must be 'Default' or 'High'.")
+def run() -> int:
+    args = parse_args()
+    root_dir = Path(__file__).resolve().parent
 
-    system_prompt = (
-        HIGH_DETAIL_DIALOGUE_SYSTEM_PROMPT if detail == "high" else DEFAULT_DIALOGUE_SYSTEM_PROMPT
-    )
+    try:
+        pdf_path = Path(args.pdf).expanduser()
+        if not pdf_path.is_absolute():
+            pdf_path = (root_dir / pdf_path).resolve()
 
-    client = _build_llm_client(
-        provider=llm_provider,
-        model=llm_model,
-        api_keys=api_keys,
-        llm_base_url=llm_base_url,
-        logger=logger,
-    )
-    llm_input = maybe_summarize_long_text(
-        llm_client=client,
-        text=paper_text,
-        max_input_chars=max_input_chars,
-        chunk_size=chunk_size,
-        logger=logger,
-    )
+        provider = _resolve_provider(args.company)
+        model = args.model
 
-    user_prompt = (
-        f"Paper title: {paper_name}\n\n"
-        f"Generate approximately {dialogue_turns} turns total.\n"
-        "Allowed output format only:\n"
-        "Host A: <text>\n"
-        "Host B: <text>\n\n"
-        "Paper content:\n"
-        f"{llm_input}"
-    )
+        temp_logger = logging.getLogger("script_only_boot")
+        temp_logger.setLevel(logging.INFO)
+        temp_logger.handlers.clear()
+        temp_logger.addHandler(logging.StreamHandler(sys.stdout))
 
-    raw = client.generate_text(
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        temperature=temperature,
-        max_output_tokens=max(256, int(max_output_tokens)),
-        thinking_budget_tokens=max(0, int(thinking_budget_tokens)),
-        enable_extended_thinking=(thinking_budget_tokens > 0),
-    )
-    lines = _normalize_dialogue(raw)
+        title, text = extract_pdf_text(pdf_path, temp_logger)
+        # Match latex.py behavior: always use source PDF filename as output folder/file base.
+        paper_name = sanitize_name(pdf_path.stem)
 
-    if detail == "high" and len(lines) < max(24, dialogue_turns):
-        retry_prompt = (
-            f"{user_prompt}\n\n"
-            "Quality update:\n"
-            "- Expand background context and methods in more depth.\n"
-            "- Explain all equations with explicit equation numbers when present.\n"
-            "- Keep strict Host A / Host B formatting."
+        final_root = Path(args.final_root).expanduser()
+        if not final_root.is_absolute():
+            final_root = (root_dir / final_root).resolve()
+        paper_dir = final_root / paper_name
+        paper_dir.mkdir(parents=True, exist_ok=True)
+
+        logger = setup_logger(paper_dir / "processing.log")
+        logger.info("Script-only run started for paper: %s", paper_name)
+
+        copied_pdf = paper_dir / pdf_path.name
+        if copied_pdf.resolve() != pdf_path.resolve():
+            shutil.copy2(pdf_path, copied_pdf)
+
+        api_keys = load_api_keys(Path(args.api_file).expanduser().resolve())
+        profile = _lookup_model_profile(model, provider)
+        input_tokens = estimate_tokens_from_text(text, model)
+        max_output, thinking = calculate_dynamic_budgets(
+            input_tokens=input_tokens,
+            context_window=int(profile["max_context_tokens"]),
+            detail_level=args.detail_level,
+            supports_extended_thinking=bool(profile["supports_extended_thinking"]),
         )
-        retry_raw = client.generate_text(
-            system_prompt=HIGH_DETAIL_DIALOGUE_SYSTEM_PROMPT,
-            user_prompt=retry_prompt,
-            temperature=temperature,
-            max_output_tokens=max(256, int(max_output_tokens)),
-            thinking_budget_tokens=max(0, int(thinking_budget_tokens)),
-            enable_extended_thinking=(thinking_budget_tokens > 0),
+
+        if args.max_output_tokens is not None:
+            max_output = int(args.max_output_tokens)
+        if args.thinking_budget is not None:
+            thinking = int(args.thinking_budget)
+        if provider != "anthropic":
+            thinking = 0
+
+        client = build_llm_client(
+            provider=provider,
+            model=model,
+            api_keys=api_keys,
+            llm_base_url=args.llm_base_url,
+            logger=logger,
         )
-        retry_lines = _normalize_dialogue(retry_raw)
-        if len(retry_lines) > len(lines):
-            lines = retry_lines
 
-    return "\n".join(lines)
+        llm_input = maybe_summarize_long_text(
+            llm_client=client,
+            text=text,
+            max_input_chars=max(5000, int(args.max_input_chars)),
+            chunk_size=max(2000, int(args.chunk_size)),
+        )
+
+        system_prompt = HIGH_DETAIL_DIALOGUE_SYSTEM_PROMPT if args.detail_level.lower() == "high" else DEFAULT_DIALOGUE_SYSTEM_PROMPT
+        user_prompt = (
+            f"Paper title: {paper_name}\n\n"
+            f"Generate approximately {max(12, int(args.dialogue_turns))} turns total.\n"
+            "Allowed output format only:\n"
+            "Host A: <text>\n"
+            "Host B: <text>\n\n"
+            "Paper content:\n"
+            f"{llm_input}"
+        )
+
+        raw = client.generate_text(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=float(args.temperature),
+            max_output_tokens=max(256, int(max_output)),
+            thinking_budget_tokens=max(0, int(thinking)),
+            enable_extended_thinking=(provider == "anthropic" and thinking > 0),
+        )
+        lines = normalize_dialogue(raw)
+
+        dialogue_path = paper_dir / f"{paper_name}.txt"
+        dialogue_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        logger.info("Dialogue saved: %s", dialogue_path)
+        return 0
+
+    except (ScriptOnlyError, ValueError, FileNotFoundError) as exc:
+        print(f"ERROR: {exc}")
+        return 1
 
 
-def save_dialogue_text(*, dialogue_text: str, output_dir: Path, paper_name: str) -> Path:
-    """Save generated dialogue text to output folder."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / f"{paper_name}.txt"
-    path.write_text(dialogue_text.rstrip() + "\n", encoding="utf-8")
-    return path
-
-
-def generate_dialogue_file_from_text(
-    *,
-    paper_name: str,
-    paper_text: str,
-    output_dir: Path,
-    api_keys: Dict[str, str],
-    llm_provider: str,
-    llm_model: str,
-    llm_base_url: Optional[str],
-    detail_level: str,
-    max_output_tokens: int,
-    thinking_budget_tokens: int,
-    dialogue_turns: int,
-    temperature: float,
-    max_input_chars: int,
-    chunk_size: int,
-    logger: logging.Logger,
-) -> Path:
-    """Generate and save dialogue file from already extracted paper text."""
-    dialogue_text = generate_dialogue_text(
-        paper_name=paper_name,
-        paper_text=paper_text,
-        api_keys=api_keys,
-        llm_provider=llm_provider,
-        llm_model=llm_model,
-        llm_base_url=llm_base_url,
-        detail_level=detail_level,
-        max_output_tokens=max_output_tokens,
-        thinking_budget_tokens=thinking_budget_tokens,
-        dialogue_turns=dialogue_turns,
-        temperature=temperature,
-        max_input_chars=max_input_chars,
-        chunk_size=chunk_size,
-        logger=logger,
-    )
-    path = save_dialogue_text(dialogue_text=dialogue_text, output_dir=output_dir, paper_name=paper_name)
-    logger.info("Dialogue file saved: %s", path)
-    return path
+if __name__ == "__main__":
+    raise SystemExit(run())
