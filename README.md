@@ -35,7 +35,7 @@ Final/<paper_name>/
 ## Requirements
 
 - Python 3.10+
-- `ffmpeg` in PATH (required by audio flow)
+- `ffmpeg` in PATH (required by audio generation/stitching)
 - TeX distribution with `pdflatex` in PATH (required by `latex.py`)
 
 Install Python packages:
@@ -122,4 +122,6 @@ pdflatex --version
 
 - Large token budgets can be slow and expensive.
 - Anthropic large requests automatically use streaming in this codebase.
-- Keep real keys local; do not commit `api.txt`.
+- Anthropic token budgets are auto-clamped to model limits and valid thinking/output relationships.
+- Audio stitching uses `ffmpeg` directly (no `pydub` dependency), which avoids Python 3.14 `audioop` issues.
+- Keep real keys local; do not commit `apit.txt`, `apiv.txt`, or `api.txt`.

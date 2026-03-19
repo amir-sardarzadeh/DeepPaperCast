@@ -33,7 +33,7 @@ from tts_audio import TTSAudioError, synthesize_audio_from_dialogue
 #   You can still override at runtime using CLI flags.
 # - EXTENDED_THINKING_ALWAYS_ON keeps reasoning mode enabled for all runs.
 
-File = "Channel_Parameter_Estimation_and_Localization_for_Near-field_XL-MIMO_Communications.pdf"
+File = "Performance Analysis of Cell-Free Massive MIMO System With Limited Fronthaul Capacity and Hardware Impairments.pdf"
 DETAIL_LEVEL = "High"
 Company = "Claude"
 Model = "claude-opus-4-6"
@@ -51,26 +51,31 @@ SUPPORTED_MODELS = {
     "claude-3-7-sonnet-latest": {
         "provider": "anthropic",
         "max_context_tokens": 200_000,
+        "max_output_tokens": 128_000,
         "supports_extended_thinking": True,
     },
     "claude-opus-4-6": {
         "provider": "anthropic",
         "max_context_tokens": 200_000,
+        "max_output_tokens": 128_000,
         "supports_extended_thinking": True,
     },
     "claude-sonnet-4-6": {
         "provider": "anthropic",
         "max_context_tokens": 200_000,
+        "max_output_tokens": 128_000,
         "supports_extended_thinking": True,
     },
     "gpt-4o": {
         "provider": "openai",
         "max_context_tokens": 128_000,
+        "max_output_tokens": 16_384,
         "supports_extended_thinking": True,
     },
     "gpt-4o-latest": {
         "provider": "openai",
         "max_context_tokens": 128_000,
+        "max_output_tokens": 16_384,
         "supports_extended_thinking": True,
     },
 }
@@ -148,9 +153,11 @@ def _lookup_model_profile(model_name: str, provider: str) -> Dict[str, object]:
             return value
 
     fallback_context = 200_000 if provider == "anthropic" else 128_000
+    fallback_output_cap = 128_000 if provider == "anthropic" else 16_384
     return {
         "provider": provider,
         "max_context_tokens": fallback_context,
+        "max_output_tokens": fallback_output_cap,
         "supports_extended_thinking": True,
     }
 
@@ -164,12 +171,14 @@ def calculate_dynamic_budgets(
     *,
     input_tokens: int,
     context_window: int,
+    max_output_cap: int,
     detail_level: str,
     supports_extended_thinking: bool,
 ) -> Tuple[int, int]:
     """Compute max_output_tokens and thinking_budget from context remaining."""
     safety_margin = max(1500, int(context_window * 0.03))
     available = max(1024, context_window - input_tokens - safety_margin)
+    available = min(available, max_output_cap)
 
     detail = detail_level.strip().lower()
     if detail == "high":
@@ -260,28 +269,41 @@ def run() -> int:
 
         profile = _lookup_model_profile(model, provider)
         context_window = int(profile["max_context_tokens"])
+        model_max_output_cap = int(profile["max_output_tokens"])
         supports_thinking = bool(profile["supports_extended_thinking"]) or EXTENDED_THINKING_ALWAYS_ON
 
         input_tokens = estimate_input_tokens(text, model)
         dyn_output, dyn_thinking = calculate_dynamic_budgets(
             input_tokens=input_tokens,
             context_window=context_window,
+            max_output_cap=model_max_output_cap,
             detail_level=args.detail_level,
             supports_extended_thinking=supports_thinking,
         )
 
         max_output_tokens = args.max_output_tokens if args.max_output_tokens is not None else dyn_output
+        max_output_tokens = min(max_output_tokens, model_max_output_cap)
         thinking_budget = args.thinking_budget if args.thinking_budget is not None else dyn_thinking
-        if EXTENDED_THINKING_ALWAYS_ON and thinking_budget <= 0:
-            thinking_budget = max(1024, max_output_tokens // 2)
+        if supports_thinking:
+            if thinking_budget >= max_output_tokens:
+                thinking_budget = max(0, max_output_tokens - 1)
+            if 0 < thinking_budget < 1024:
+                thinking_budget = 0
+            if EXTENDED_THINKING_ALWAYS_ON and thinking_budget <= 0 and max_output_tokens > 1024:
+                thinking_budget = max(1024, max_output_tokens // 2)
+                if thinking_budget >= max_output_tokens:
+                    thinking_budget = max_output_tokens - 1
+        else:
+            thinking_budget = 0
 
         logger.info(
-            "LLM config: provider=%s model=%s detail=%s input_tokens~%d context=%d max_output=%d thinking_budget=%d",
+            "LLM config: provider=%s model=%s detail=%s input_tokens~%d context=%d model_output_cap=%d max_output=%d thinking_budget=%d",
             provider,
             model,
             args.detail_level,
             input_tokens,
             context_window,
+            model_max_output_cap,
             max_output_tokens,
             thinking_budget,
         )

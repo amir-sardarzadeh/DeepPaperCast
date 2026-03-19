@@ -5,17 +5,22 @@ from __future__ import annotations
 
 import argparse
 import logging
+import subprocess
 import sys
 from pathlib import Path
 from typing import List
-
-from pydub import AudioSegment
 
 TARGET_SAMPLE_RATE_HZ = 48_000
 TARGET_MP3_BITRATE = "320k"
 # Quick-start config (edit then run: python stitch_audio.py)
 SEGMENTS_DIR = r"Final\Your_Paper_Title\voice_segments"
 OUTPUT_FILE = ""
+
+
+def _ffmpeg_concat_entry(path: Path) -> str:
+    """Build one safe concat-demuxer manifest line for ffmpeg."""
+    escaped = path.resolve().as_posix().replace("'", "'\\''")
+    return f"file '{escaped}'"
 
 
 class StitchAudioError(RuntimeError):
@@ -59,18 +64,46 @@ def _list_segment_files(segments_dir: Path) -> List[Path]:
 
 
 def stitch_segments(*, segments_dir: Path, output_path: Path, logger: logging.Logger) -> Path:
-    """Stitch segment files into one final MP3."""
+    """Stitch segment files into one final MP3 using ffmpeg."""
     segment_files = _list_segment_files(segments_dir)
     logger.info("Found %d segment files.", len(segment_files))
 
-    combined = AudioSegment.silent(duration=0)
-    for segment_path in segment_files:
-        logger.info("Adding segment: %s", segment_path.name)
-        combined += AudioSegment.from_file(segment_path)
+    manifest_path = segments_dir / "_ffmpeg_concat_input.txt"
+    manifest_lines = [_ffmpeg_concat_entry(p) for p in segment_files]
+    manifest_path.write_text("\n".join(manifest_lines) + "\n", encoding="utf-8")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    combined = combined.set_frame_rate(TARGET_SAMPLE_RATE_HZ)
-    combined.export(output_path, format="mp3", bitrate=TARGET_MP3_BITRATE)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(manifest_path),
+        "-ar",
+        str(TARGET_SAMPLE_RATE_HZ),
+        "-b:a",
+        TARGET_MP3_BITRATE,
+        "-vn",
+        str(output_path),
+    ]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except FileNotFoundError as exc:
+        raise StitchAudioError("ffmpeg not found in PATH. Install ffmpeg and try again.") from exc
+    finally:
+        try:
+            manifest_path.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    if proc.returncode != 0:
+        stderr_tail = (proc.stderr or "").strip()[-1200:]
+        raise StitchAudioError(f"ffmpeg stitching failed: {stderr_tail or 'Unknown ffmpeg error.'}")
+
     logger.info("Exported stitched audio: %s", output_path)
     return output_path
 

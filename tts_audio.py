@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List
 
-from pydub import AudioSegment
-
 SPEAKER_RE = re.compile(r"^(Host\s*A|Host\s*B|Person\s*A|Person\s*B)\s*:\s*(.*)$", re.IGNORECASE)
 TARGET_SAMPLE_RATE_HZ = 48_000
 TARGET_MP3_BITRATE = "320k"
+
+
+def _ffmpeg_concat_entry(path: Path) -> str:
+    """Build one safe concat-demuxer manifest line for ffmpeg."""
+    escaped = path.resolve().as_posix().replace("'", "'\\''")
+    return f"file '{escaped}'"
 
 
 class TTSAudioError(RuntimeError):
@@ -198,7 +203,7 @@ def stitch_saved_segments(
     output_path: Path,
     logger: logging.Logger,
 ) -> Path:
-    """Stitch already saved audio segments from voice_segments/ into one file."""
+    """Stitch already saved audio segments from voice_segments/ into one file with ffmpeg."""
     if not segments_dir.exists():
         raise TTSAudioError(f"Segments folder not found: {segments_dir}")
 
@@ -209,14 +214,42 @@ def stitch_saved_segments(
     if not segment_files:
         raise TTSAudioError(f"No audio segment files found in: {segments_dir}")
 
-    logger.info("Stitching %d segments from %s", len(segment_files), segments_dir)
-    combined = AudioSegment.silent(duration=0)
-    for segment_path in segment_files:
-        combined += AudioSegment.from_file(segment_path)
+    logger.info("Stitching %d segments from %s via ffmpeg", len(segment_files), segments_dir)
+    manifest_path = segments_dir / "_ffmpeg_concat_input.txt"
+    manifest_lines = [_ffmpeg_concat_entry(p) for p in segment_files]
+    manifest_path.write_text("\n".join(manifest_lines) + "\n", encoding="utf-8")
 
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(manifest_path),
+        "-ar",
+        str(TARGET_SAMPLE_RATE_HZ),
+        "-b:a",
+        TARGET_MP3_BITRATE,
+        "-vn",
+        str(output_path),
+    ]
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    combined = combined.set_frame_rate(TARGET_SAMPLE_RATE_HZ)
-    combined.export(output_path, format="mp3", bitrate=TARGET_MP3_BITRATE)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except FileNotFoundError as exc:
+        raise TTSAudioError("ffmpeg not found in PATH. Install ffmpeg and try again.") from exc
+    finally:
+        try:
+            manifest_path.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    if proc.returncode != 0:
+        stderr_tail = (proc.stderr or "").strip()[-1200:]
+        raise TTSAudioError(f"ffmpeg stitching failed: {stderr_tail or 'Unknown ffmpeg error.'}")
+
     logger.info("Final stitched audio saved: %s", output_path)
     return output_path
 

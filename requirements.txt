@@ -2,7 +2,6 @@
 anthropic>=0.39.0
 pypdf>=4.0.0
 pdfplumber>=0.10.0
-pydub>=0.25.1
 tiktoken>=0.7.0
 python-dotenv>=1.0.0
 requests>=2.31.0

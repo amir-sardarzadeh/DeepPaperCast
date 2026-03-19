@@ -235,6 +235,67 @@ class AnthropicMessagesClient(BaseLLMClient):
     def _is_streaming_required_error(exc: Exception) -> bool:
         return "streaming is required" in str(exc).lower()
 
+    @staticmethod
+    def _extract_max_tokens_limit(error_text: str) -> Optional[int]:
+        """
+        Parse Anthropic max_tokens cap from errors like:
+        "max_tokens: 168529 > 128000, which is the maximum allowed ..."
+        """
+        match = re.search(r"max_tokens:\s*\d+\s*>\s*(\d+)", error_text, flags=re.IGNORECASE)
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _is_thinking_budget_relation_error(error_text: str) -> bool:
+        lowered = error_text.lower()
+        return "max_tokens" in lowered and "thinking.budget_tokens" in lowered and "greater than" in lowered
+
+    def _normalize_thinking_payload(self, payload: Dict[str, object]) -> None:
+        """Ensure Anthropic thinking payload obeys budget constraints."""
+        max_tokens = int(payload.get("max_tokens", 0) or 0)
+        thinking_obj = payload.get("thinking")
+        if not isinstance(thinking_obj, dict):
+            return
+
+        budget = int(thinking_obj.get("budget_tokens", 0) or 0)
+        if budget >= max_tokens:
+            budget = max_tokens - 1
+        if budget < 1024:
+            payload.pop("thinking", None)
+            return
+        thinking_obj["budget_tokens"] = budget
+        payload["thinking"] = thinking_obj
+
+    def _apply_token_cap_from_error(self, payload: Dict[str, object], error_text: str) -> bool:
+        """
+        Apply automatic payload fixes from token-related API errors.
+        Returns True if payload was changed.
+        """
+        changed = False
+        cap = self._extract_max_tokens_limit(error_text)
+        if cap and int(payload.get("max_tokens", 0) or 0) > cap:
+            payload["max_tokens"] = cap
+            changed = True
+
+        if self._is_thinking_budget_relation_error(error_text):
+            self._normalize_thinking_payload(payload)
+            changed = True
+
+        thinking_obj = payload.get("thinking")
+        if isinstance(thinking_obj, dict):
+            pre_budget = int(thinking_obj.get("budget_tokens", 0) or 0)
+            self._normalize_thinking_payload(payload)
+            post_obj = payload.get("thinking")
+            post_budget = int(post_obj.get("budget_tokens", 0) or 0) if isinstance(post_obj, dict) else 0
+            if pre_budget != post_budget:
+                changed = True
+
+        return changed
+
     def _send(self, payload: Dict[str, object], force_stream: bool = False) -> object:
         max_tokens = int(payload.get("max_tokens", 0) or 0)
         use_stream = force_stream or max_tokens >= ANTHROPIC_STREAMING_MAX_TOKENS_THRESHOLD
@@ -254,6 +315,13 @@ class AnthropicMessagesClient(BaseLLMClient):
         thinking_budget_tokens: int,
         enable_extended_thinking: bool,
     ) -> str:
+        max_output_tokens = max(256, int(max_output_tokens))
+        thinking_budget_tokens = max(0, int(thinking_budget_tokens))
+        if thinking_budget_tokens >= max_output_tokens:
+            thinking_budget_tokens = max_output_tokens - 1
+        if 0 < thinking_budget_tokens < 1024:
+            thinking_budget_tokens = 0
+
         payload: Dict[str, object] = {
             "model": self.model,
             "system": system_prompt,
@@ -276,14 +344,43 @@ class AnthropicMessagesClient(BaseLLMClient):
         try:
             message = self._send(payload)
         except Exception as exc:  # noqa: BLE001
-            if "thinking" in payload:
+            recovered = False
+            error_text = str(exc)
+            if self._apply_token_cap_from_error(payload, error_text):
+                self.logger.warning(
+                    "Anthropic request rejected by token constraints (%s). Retrying with max_tokens=%s%s.",
+                    exc,
+                    payload.get("max_tokens"),
+                    f", thinking_budget={payload['thinking'].get('budget_tokens')}" if isinstance(payload.get("thinking"), dict) else "",
+                )
+                try:
+                    message = self._send(payload)
+                    recovered = True
+                except Exception as adjusted_exc:  # noqa: BLE001
+                    error_text = str(adjusted_exc)
+                    exc = adjusted_exc
+
+            if recovered:
+                pass
+            elif "thinking" in payload:
                 self.logger.warning("Anthropic thinking request failed (%s). Retrying without thinking.", exc)
                 payload.pop("thinking", None)
                 payload["temperature"] = temperature
                 try:
                     message = self._send(payload)
                 except Exception as retry_exc:  # noqa: BLE001
-                    raise LLMWriterError(f"Anthropic API error: {retry_exc}") from retry_exc
+                    retry_text = str(retry_exc)
+                    if self._apply_token_cap_from_error(payload, retry_text):
+                        self.logger.warning(
+                            "Anthropic non-thinking retry also exceeded token limit. Retrying with max_tokens=%s.",
+                            payload.get("max_tokens"),
+                        )
+                        try:
+                            message = self._send(payload)
+                        except Exception as final_retry_exc:  # noqa: BLE001
+                            raise LLMWriterError(f"Anthropic API error: {final_retry_exc}") from final_retry_exc
+                    else:
+                        raise LLMWriterError(f"Anthropic API error: {retry_exc}") from retry_exc
             elif self._is_streaming_required_error(exc):
                 try:
                     message = self._send(payload, force_stream=True)
