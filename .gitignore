@@ -8,6 +8,7 @@ __pycache__/
 # Local secrets
 apit.txt
 apiv.txt
+api.txt
 
 # Logs
 logs/
