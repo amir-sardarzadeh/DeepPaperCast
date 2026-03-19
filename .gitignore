@@ -20,6 +20,7 @@ logs/
 # Generated inputs/transcripts/outputs
 *.pdf
 outputs/
+Final/
 Why LLM-Centric Systems Underperform on/
 Towards 6G MIMO_ Massive Spatial Multiplexing,/
 

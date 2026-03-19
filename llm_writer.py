@@ -9,28 +9,28 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 
-DIALOGUE_SYSTEM_PROMPT = """You are a world-class podcast producer and scriptwriter.
-Write a lively, engaging two-person podcast transcript between Host A and Host B about the provided academic paper.
-This should feel like a deep-dive educational episode, not a quick summary.
-
-Host Dynamics:
-- Host A is the structured guide, introducing the paper and driving the narrative forward.
-- Host B is the insightful color commentator, asking clarifying questions, summarizing complex points, and providing relatable analogies.
+DEFAULT_SYSTEM_PROMPT = """You are a world-class podcast producer and scriptwriter.
+Write a clear, engaging two-person podcast transcript between Host A and Host B about the provided academic paper.
 
 Requirements:
-- Keep the conversation highly engaging, conversational, and accessible.
-- Explain highly technical ideas and complex math conceptually. DO NOT read raw equations, Greek letters, or code blocks (Only read them if they are clear and not long). Translate math into physical or visual analogies.
-- Cover in depth: background context, the core problem, prior approaches, the paper's methodology, experiments, key findings, limitations, and practical real-world implications.
-- Include concrete details from the paper (datasets, baselines, metrics, or result magnitudes) whenever available.
-- Keep most speaking turns in the 2-5 sentence range, with occasional longer turns when unpacking complex concepts.
-- Do not over-compress. Prioritize clear explanation of how the paper works step-by-step.
-- This is a detailed-only format: never provide a short overview version.
-- Style for voice delivery: use bright, intellectually curious language with warm enthusiasm. Keep banter brisk, but slow down when introducing a dense concept or the main takeaway.
-- Add occasional transition hooks and analogy setups, for example: "But here's the crazy part," or "Think about it like this," where natural.
-- Use punctuation that helps spoken rhythm: brief conversational beats around dense terms and just before analogies.
-- Audio/TTS Constraints: DO NOT use emojis, markdown, bullet points, stage directions (e.g., [laughs]), or narrator notes. Spell out symbols (e.g., write "percent" instead of "%").
+- Keep the explanation concise but informative.
+- Cover the problem, core method, key findings, limitations, and practical implications.
+- Explain technical concepts in plain language with occasional analogies.
+- Audio/TTS Constraints: DO NOT use emojis, markdown, bullet points, stage directions, or narrator notes.
 - STRICT FORMAT: Every single line must begin with exactly "Host A:" or "Host B:".
-- Start with Host A welcoming the listener and alternate naturally.
+"""
+
+HIGH_DETAIL_SYSTEM_PROMPT = """You are a world-class podcast producer and scriptwriter.
+Write a highly comprehensive, extended-length, two-person podcast transcript between Host A and Host B about the provided academic paper.
+
+Requirements:
+- Maximize your token budget. This is a deep dive.
+- Take the time to explain the background context and foundational concepts before diving into the paper's novel contributions. Assume the listener is intelligent but needs the academic jargon unpacked.
+- Detail the methodology step-by-step. Discuss *why* the authors chose this approach and what the alternatives might have been.
+- Explore the limitations and real-world implications in depth.
+- Host A acts as the structured guide and expert. Host B acts as the highly curious learner asking probing, intelligent follow-up questions.
+- Audio/TTS Constraints: DO NOT use emojis, markdown, bullet points, stage directions (e.g., [laughs]), or narrator notes. Translate complex equations into physical or visual analogies.
+- STRICT FORMAT: Every single line must begin with exactly "Host A:" or "Host B:".
 """
 
 CHUNK_SUMMARY_SYSTEM_PROMPT = """You are an expert research assistant preparing notes for a podcast host. 
@@ -47,6 +47,10 @@ Return concise plain text structured strictly with the following headings:
 """
 
 SPEAKER_RE = re.compile(r"^(Host\s*A|Host\s*B|Person\s*A|Person\s*B)\s*:\s*(.*)$", re.IGNORECASE)
+DEFAULT_DETAIL_LEVEL = "Default"
+HIGH_DETAIL_LEVEL = "High"
+HIGH_DETAIL_MAX_OUTPUT_TOKENS = 4096
+DEFAULT_MAX_OUTPUT_TOKENS = 2200
 
 
 @dataclass
@@ -534,17 +538,41 @@ def _dialogue_word_count(lines: List[str]) -> int:
     return len(re.findall(r"\b\w+\b", "\n".join(lines)))
 
 
+def _resolve_detail_level(detail_level: str) -> str:
+    """Normalize and validate detail level."""
+    value = (detail_level or "").strip().lower()
+    if value == "high":
+        return HIGH_DETAIL_LEVEL
+    if value == "default":
+        return DEFAULT_DETAIL_LEVEL
+    raise LLMWriterError("detail_level must be either 'Default' or 'High'.")
+
+
+def _prompt_settings(detail_level: str) -> tuple[str, int, bool]:
+    """Return system prompt, output token budget, and extended thinking switch."""
+    if detail_level == HIGH_DETAIL_LEVEL:
+        return HIGH_DETAIL_SYSTEM_PROMPT, HIGH_DETAIL_MAX_OUTPUT_TOKENS, True
+    return DEFAULT_SYSTEM_PROMPT, DEFAULT_MAX_OUTPUT_TOKENS, False
+
+
 def _generate_dialogue_text(
     *,
     llm_client: BaseLLMClient,
     paper_name: str,
     source_text: str,
     dialogue_turns: int,
+    detail_level: str,
     temperature: float,
     logger: logging.Logger,
 ) -> str:
     """Generate dialogue text from paper content using the selected LLM client."""
-    logger.info("Generating final dialogue with %d target turns.", dialogue_turns)
+    resolved_detail_level = _resolve_detail_level(detail_level)
+    system_prompt, max_output_tokens, enable_extended_thinking = _prompt_settings(resolved_detail_level)
+    logger.info(
+        "Generating final dialogue with %d target turns (detail_level=%s).",
+        dialogue_turns,
+        resolved_detail_level,
+    )
     base_user_prompt = (
         f"Paper title: {paper_name}\n\n"
         f"Generate approximately {dialogue_turns} turns total.\n"
@@ -555,53 +583,47 @@ def _generate_dialogue_text(
         f"{source_text}"
     )
     raw = llm_client.generate_text(
-        system_prompt=DIALOGUE_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         user_prompt=base_user_prompt,
         temperature=temperature,
-        max_output_tokens=18000,
-        enable_extended_thinking=True,
+        max_output_tokens=max_output_tokens,
+        enable_extended_thinking=enable_extended_thinking,
     )
     lines = _parse_and_normalize_dialogue(raw)
     if len(lines) < 4:
         raise LLMWriterError("Generated dialogue is too short to build podcast audio.")
 
-    min_lines = max(24, dialogue_turns)
-    min_words = max(1500, dialogue_turns * 45)
     words = _dialogue_word_count(lines)
-    if len(lines) < min_lines or words < min_words:
-        logger.warning(
-            "Dialogue looks too concise (lines=%d, words=%d). Regenerating with stronger depth constraints.",
-            len(lines),
-            words,
-        )
-        depth_prompt = (
-            f"{base_user_prompt}\n\n"
-            "Quality bar update:\n"
-            "- Expand background context and method details.\n"
-            "- Explain how the approach works step-by-step.\n"
-            "- Include concrete experimental details and limitations.\n"
-            "- Keep the format strictly Host A/Host B lines.\n"
-            "- Keep most turns at 3-6 sentences, unless a shorter interjection is needed for natural flow.\n"
-            f"- Minimum target: at least {min_lines} lines and about {min_words} words total."
-        )
-        raw_retry = llm_client.generate_text(
-            system_prompt=DIALOGUE_SYSTEM_PROMPT,
-            user_prompt=depth_prompt,
-            temperature=temperature,
-            max_output_tokens=20000,
-            enable_extended_thinking=True,
-        )
-        retry_lines = _parse_and_normalize_dialogue(raw_retry)
-        retry_words = _dialogue_word_count(retry_lines)
-        if len(retry_lines) > len(lines) or retry_words > words:
-            lines = retry_lines
-            words = retry_words
-
-    if len(lines) < min_lines or words < min_words:
-        raise LLMWriterError(
-            f"Detailed-only mode failed: dialogue still too short (lines={len(lines)}, words={words}). "
-            f"Expected at least ~{min_lines} lines and ~{min_words} words."
-        )
+    if resolved_detail_level == HIGH_DETAIL_LEVEL:
+        min_lines = max(24, dialogue_turns)
+        min_words = max(1200, dialogue_turns * 25)
+        if len(lines) < min_lines or words < min_words:
+            logger.warning(
+                "High-detail output looks concise (lines=%d, words=%d). Retrying with stronger depth instructions.",
+                len(lines),
+                words,
+            )
+            depth_prompt = (
+                f"{base_user_prompt}\n\n"
+                "Quality bar update:\n"
+                "- Expand background and prerequisite concepts before the method details.\n"
+                "- Explain each major method component step-by-step and why it matters.\n"
+                "- Cover experimental setup, baselines, metrics, and limitations in depth.\n"
+                "- Keep strict Host A / Host B line formatting.\n"
+                f"- Target at least {min_lines} lines and around {min_words} words."
+            )
+            raw_retry = llm_client.generate_text(
+                system_prompt=HIGH_DETAIL_SYSTEM_PROMPT,
+                user_prompt=depth_prompt,
+                temperature=temperature,
+                max_output_tokens=HIGH_DETAIL_MAX_OUTPUT_TOKENS,
+                enable_extended_thinking=True,
+            )
+            retry_lines = _parse_and_normalize_dialogue(raw_retry)
+            retry_words = _dialogue_word_count(retry_lines)
+            if len(retry_lines) > len(lines) or retry_words > words:
+                lines = retry_lines
+                words = retry_words
 
     logger.info("Dialogue generation complete. Parsed lines: %d, words: %d", len(lines), words)
     return "\n".join(lines)
@@ -618,6 +640,7 @@ def generate_dialogue_file_from_pdf(
     dialogue_turns: int,
     max_input_chars: int,
     chunk_size: int,
+    detail_level: str,
     anthropic_extended_thinking: bool,
     anthropic_thinking_budget_tokens: int,
     output_dir: Path,
@@ -638,6 +661,7 @@ def generate_dialogue_file_from_pdf(
         anthropic_thinking_budget_tokens=anthropic_thinking_budget_tokens,
     )
     logger.info("LLM client ready. Provider=%s, Model=%s", llm_provider, llm_model)
+    logger.info("Dialogue detail level: %s", _resolve_detail_level(detail_level))
 
     llm_input = _summarize_if_needed(
         llm_client=llm_client,
@@ -652,6 +676,7 @@ def generate_dialogue_file_from_pdf(
         paper_name=paper_name,
         source_text=llm_input,
         dialogue_turns=dialogue_turns,
+        detail_level=detail_level,
         temperature=temperature,
         logger=logger,
     )

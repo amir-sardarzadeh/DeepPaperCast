@@ -23,11 +23,13 @@ from tts_audio import synthesize_audio_from_dialogue
 # Model = "claude-sonnet-4-5" "claude-sonnet-4-6" "gpt-5.4-pro"
 # ExtendedThinking = True  # Anthropic only
 # ThinkingBudgetTokens = 12000  # Anthropic only
+# DETAIL_LEVEL = "Default" or "High"
 File = "2401.02844v1.pdf"
 Company = "Claude"
 Model = "claude-sonnet-4-6"
 ExtendedThinking = True
 ThinkingBudgetTokens = 12000
+DETAIL_LEVEL = "High"
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,6 +62,12 @@ def parse_args() -> argparse.Namespace:
         help="Shortcut for provider: 'OpenAI' -> openai, 'Claude' -> anthropic.",
     )
     parser.add_argument("--llm-model", "--model", dest="llm_model", default=None, help="LLM model name.")
+    parser.add_argument(
+        "--detail-level",
+        default=None,
+        choices=["Default", "High"],
+        help="Script detail level for dialogue generation.",
+    )
     parser.add_argument(
         "--extended-thinking",
         action=argparse.BooleanOptionalAction,
@@ -158,6 +166,18 @@ def _resolve_model(model_value: str | None) -> str:
     return model
 
 
+def _resolve_detail_level(detail_level_value: str | None) -> str:
+    """Resolve and validate detail level value."""
+    value = (detail_level_value or "").strip().lower()
+    if not value:
+        raise ValueError("Set DETAIL_LEVEL at the top of main.py or pass --detail-level.")
+    if value == "default":
+        return "Default"
+    if value == "high":
+        return "High"
+    raise ValueError("DETAIL_LEVEL must be either 'Default' or 'High'.")
+
+
 def _normalize_model_for_provider(provider: str, model: str) -> str:
     """Allow simple model shortcuts like 'Sonnet' and normalize to provider model ids."""
     p = provider.lower()
@@ -231,10 +251,12 @@ def organize_outputs(
     pdf_path: Path,
     dialogue_path: Path,
     audio_path: Path,
+    final_root: Path,
     logger: logging.Logger,
 ) -> Path:
     """Move the PDF, dialogue text, and audio file into a folder named after the paper."""
-    target_dir = pdf_path.parent / "outputs" / paper_name
+    final_root.mkdir(parents=True, exist_ok=True)
+    target_dir = final_root / paper_name
     target_dir.mkdir(parents=True, exist_ok=True)
     logger.info("Organizing outputs into folder: %s", target_dir)
 
@@ -263,6 +285,7 @@ def run() -> int:
         resolved_pdf_value = args.pdf if args.pdf else File
         resolved_company = args.company if args.company else Company
         resolved_model = _resolve_model(args.llm_model if args.llm_model else Model)
+        resolved_detail_level = _resolve_detail_level(args.detail_level if args.detail_level else DETAIL_LEVEL)
         resolved_provider = _resolve_provider(args.llm_provider, resolved_company)
         resolved_model = _normalize_model_for_provider(resolved_provider, resolved_model)
         resolved_extended_thinking = (
@@ -284,11 +307,12 @@ def run() -> int:
         )
 
         logger.info(
-            "Resolved config: file=%s, company=%s, provider=%s, model=%s, extended_thinking=%s, thinking_budget=%s",
+            "Resolved config: file=%s, company=%s, provider=%s, model=%s, detail_level=%s, extended_thinking=%s, thinking_budget=%s",
             pdf_path,
             resolved_company,
             resolved_provider,
             resolved_model,
+            resolved_detail_level,
             resolved_extended_thinking,
             resolved_thinking_budget,
         )
@@ -312,6 +336,7 @@ def run() -> int:
             dialogue_turns=max(36, args.dialogue_turns),
             max_input_chars=max(5000, args.max_input_chars),
             chunk_size=max(2000, args.chunk_size),
+            detail_level=resolved_detail_level,
             anthropic_extended_thinking=bool(resolved_extended_thinking),
             anthropic_thinking_budget_tokens=max(1024, int(resolved_thinking_budget)),
             output_dir=pdf_path.parent,
@@ -338,6 +363,7 @@ def run() -> int:
             pdf_path=pdf_path,
             dialogue_path=dialogue_result.dialogue_path,
             audio_path=audio_path,
+            final_root=script_dir / "Final",
             logger=logger,
         )
 
