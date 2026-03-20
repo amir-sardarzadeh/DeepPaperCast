@@ -75,6 +75,14 @@ Edit config at top of `main.py` (or pass CLI args), then run:
 python main.py
 ```
 
+`DETAIL_LEVEL` options in `main.py`:
+- `Default`: concise podcast script
+- `Medium`: previous single-pass high-detail behavior
+- `High`: 3-part macro-chunk deep dive
+  - Part 1: background/problem framing
+  - Part 2: methodology + formulas
+  - Part 3: results, limitations, implications, outro
+
 ### 2. Transcript only
 
 Edit config at top of `script_only.py` (or pass `--pdf`), then run:

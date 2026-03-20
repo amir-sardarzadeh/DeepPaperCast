@@ -24,7 +24,7 @@ from tts_audio import TTSAudioError, synthesize_audio_from_dialogue
 # Quick-start config
 # ---------------------------------------------------------------------------
 # Options:
-# - DETAIL_LEVEL: "Default" or "High"
+# - DETAIL_LEVEL: "Default", "Medium", or "High"
 # - Company: "OpenAI" or "Claude"
 # - Model examples:
 #   - Claude: "claude-3-7-sonnet-latest", "claude-opus-4-6", "claude-sonnet-4-6"
@@ -33,7 +33,7 @@ from tts_audio import TTSAudioError, synthesize_audio_from_dialogue
 #   You can still override at runtime using CLI flags.
 # - EXTENDED_THINKING_ALWAYS_ON keeps reasoning mode enabled for all runs.
 
-File = "Performance Analysis of Cell-Free Massive MIMO System With Limited Fronthaul Capacity and Hardware Impairments.pdf"
+File = "Federated_Learning_Based_Near-Field_Channel_Estimation_for_XL-MIMO_Communications.pdf"
 DETAIL_LEVEL = "High"
 Company = "Claude"
 Model = "claude-opus-4-6"
@@ -89,7 +89,7 @@ def parse_args() -> argparse.Namespace:
     """Parse CLI arguments for the orchestrator."""
     parser = argparse.ArgumentParser(description="Generate podcast assets from a research paper PDF.")
     parser.add_argument("--pdf", default=File, help="Input PDF path.")
-    parser.add_argument("--detail-level", choices=["Default", "High"], default=DETAIL_LEVEL)
+    parser.add_argument("--detail-level", choices=["Default", "Medium", "High"], default=DETAIL_LEVEL)
     parser.add_argument("--company", default=Company, help="OpenAI or Claude")
     parser.add_argument("--model", default=Model, help="Writer model id")
     parser.add_argument("--api-writer-file", default=API_WRITER_FILE, help="Path to writer API keys file (apit.txt)")

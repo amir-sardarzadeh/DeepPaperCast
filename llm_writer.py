@@ -33,6 +33,51 @@ Requirements:
 - STRICT FORMAT: Every single line must begin with exactly "Host A:" or "Host B:".
 """
 
+HIGH_DETAIL_PART1_SYSTEM_PROMPT = """You are a world-class podcast producer and scriptwriter creating a highly detailed, extended-length, two-person podcast.
+You are writing Part 1 of 3.
+
+Your specific task for Part 1:
+Focus exclusively on the paper's introduction, the background context, the existing literature, and the core problem the authors are trying to solve.
+
+Requirements:
+- Maximize your output. Take your time setting up the stakes and foundational concepts. Assume the listener is intelligent but needs complex jargon unpacked.
+- Host A acts as the expert guide. Host B acts as the highly curious learner asking probing follow-up questions.
+- DO NOT dive into the deep methodology, equations, or final results yet. Leave those for later parts.
+- DO NOT conclude or wrap up the episode. End Part 1 on a conversational cliffhanger or a transition leading into the methodology.
+- Audio/TTS Constraints: DO NOT use emojis, markdown, bullet points, stage directions, or narrator notes.
+- STRICT FORMAT: Every single line must begin with exactly "Host A:" or "Host B:".
+"""
+
+HIGH_DETAIL_PART2_SYSTEM_PROMPT = """You are a world-class podcast producer and scriptwriter. You are writing Part 2 of 3 of an ongoing podcast about the provided academic paper.
+
+Below is the entire transcript of Part 1.
+
+Your specific task for Part 2:
+Read the transcript so far so you know exactly what has been covered. Then, seamlessly continue the conversation, focusing exclusively on the methodology, the architecture, and the complex math.
+
+Requirements:
+- DO NOT repeat introductions, greetings, or background information already covered in Part 1. Pick up the dialogue exactly where the previous text left off.
+- Maximize your output. Detail the methodology step-by-step. Discuss why the authors chose this approach and what the alternatives were.
+- STRICT Formula Handling: You MUST explain the core formulas presented in the paper. State the equation number explicitly (for example: "Looking at Equation 4..."). Translate these equations into relatable physical or visual analogies. DO NOT just read raw math symbols.
+- DO NOT cover the final experimental results or real-world implications yet.
+- DO NOT conclude the episode. End on a transition leading toward the results.
+- STRICT FORMAT: Every single line must begin with exactly "Host A:" or "Host B:".
+"""
+
+HIGH_DETAIL_PART3_SYSTEM_PROMPT = """You are a world-class podcast producer and scriptwriter. You are writing Part 3 of 3, the final segment of an ongoing podcast about the provided academic paper.
+
+Below is the entire accumulated transcript of Parts 1 and 2.
+
+Your specific task for Part 3:
+Read the transcript so far to understand the full context. Then, seamlessly continue the conversation, focusing on the experimental results, the limitations/caveats, and the real-world implications of this research.
+
+Requirements:
+- DO NOT repeat the background or methodology. Pick up the dialogue exactly where Part 2 left off.
+- Maximize your output to thoroughly unpack the data and what it actually means for the future of the field.
+- Once the results and limitations have been thoroughly explored, guide the hosts to a natural, engaging outro and conclude the episode.
+- STRICT FORMAT: Every single line must begin with exactly "Host A:" or "Host B:".
+"""
+
 CHUNK_SUMMARY_SYSTEM_PROMPT = """You are an expert research assistant preparing notes for a long-form technical explanation.
 Summarize the provided section of an academic paper.
 
@@ -557,6 +602,162 @@ def _normalize_dialogue(raw: str) -> List[str]:
     return lines
 
 
+def _generate_high_detail_macro_chunks(
+    *,
+    llm_client: BaseLLMClient,
+    paper_name: str,
+    llm_input: str,
+    dialogue_turns: int,
+    temperature: float,
+    max_output_tokens: int,
+    thinking_budget_tokens: int,
+    logger: logging.Logger,
+) -> List[str]:
+    """
+    Generate High-detail script using a 3-part macro-chunking sequence.
+    Part 1: Context/problem.
+    Part 2: Methodology/math (continues from Part 1 transcript).
+    Part 3: Results/implications/outro (continues from Parts 1+2 transcript).
+    """
+    per_part_max_output = max(256, int(max_output_tokens) // 3)
+    per_part_thinking = max(0, int(thinking_budget_tokens) // 3)
+    if per_part_thinking >= per_part_max_output:
+        per_part_thinking = per_part_max_output - 1
+    if 0 < per_part_thinking < 1024:
+        per_part_thinking = 0
+    per_part_turn_target = max(8, int(dialogue_turns) // 3)
+
+    logger.info(
+        "High mode macro-chunking enabled. per_part_max_output=%d per_part_thinking=%d target_turns_per_part~%d",
+        per_part_max_output,
+        per_part_thinking,
+        per_part_turn_target,
+    )
+
+    part1_user_prompt = (
+        f"Paper title: {paper_name}\n\n"
+        f"Target speaking turns for this part: approximately {per_part_turn_target}.\n\n"
+        "Paper content:\n"
+        f"{llm_input}"
+    )
+    part1_raw = llm_client.generate_text(
+        system_prompt=HIGH_DETAIL_PART1_SYSTEM_PROMPT,
+        user_prompt=part1_user_prompt,
+        temperature=temperature,
+        max_output_tokens=per_part_max_output,
+        thinking_budget_tokens=per_part_thinking,
+        enable_extended_thinking=(per_part_thinking > 0),
+    )
+    part1_lines = _normalize_dialogue(part1_raw)
+    transcript_so_far = "\n".join(part1_lines)
+
+    part2_user_prompt = (
+        f"Paper title: {paper_name}\n\n"
+        f"Target speaking turns for this part: approximately {per_part_turn_target}.\n\n"
+        "Continue from the transcript below.\n\n"
+        "[FULL_TRANSCRIPT_SO_FAR]\n"
+        f"{transcript_so_far}\n\n"
+        "Paper content:\n"
+        f"{llm_input}"
+    )
+    part2_raw = llm_client.generate_text(
+        system_prompt=HIGH_DETAIL_PART2_SYSTEM_PROMPT,
+        user_prompt=part2_user_prompt,
+        temperature=temperature,
+        max_output_tokens=per_part_max_output,
+        thinking_budget_tokens=per_part_thinking,
+        enable_extended_thinking=(per_part_thinking > 0),
+    )
+    part2_lines = _normalize_dialogue(part2_raw)
+    transcript_so_far = "\n".join(part1_lines + part2_lines)
+
+    part3_user_prompt = (
+        f"Paper title: {paper_name}\n\n"
+        f"Target speaking turns for this part: approximately {per_part_turn_target}.\n\n"
+        "Continue from the transcript below.\n\n"
+        "[FULL_TRANSCRIPT_SO_FAR]\n"
+        f"{transcript_so_far}\n\n"
+        "Paper content:\n"
+        f"{llm_input}"
+    )
+    part3_raw = llm_client.generate_text(
+        system_prompt=HIGH_DETAIL_PART3_SYSTEM_PROMPT,
+        user_prompt=part3_user_prompt,
+        temperature=temperature,
+        max_output_tokens=per_part_max_output,
+        thinking_budget_tokens=per_part_thinking,
+        enable_extended_thinking=(per_part_thinking > 0),
+    )
+    part3_lines = _normalize_dialogue(part3_raw)
+
+    combined = part1_lines + part2_lines + part3_lines
+    logger.info(
+        "High mode macro-chunking complete. Lines: part1=%d part2=%d part3=%d total=%d",
+        len(part1_lines),
+        len(part2_lines),
+        len(part3_lines),
+        len(combined),
+    )
+    return combined
+
+
+def _generate_medium_detail_dialogue(
+    *,
+    llm_client: BaseLLMClient,
+    paper_name: str,
+    llm_input: str,
+    dialogue_turns: int,
+    temperature: float,
+    max_output_tokens: int,
+    thinking_budget_tokens: int,
+) -> List[str]:
+    """
+    Generate Medium-detail dialogue using the previous single-pass high-detail flow.
+    This preserves the old High behavior while current High uses macro-chunking.
+    """
+    user_prompt = (
+        f"Paper title: {paper_name}\n\n"
+        f"Generate approximately {dialogue_turns} turns total.\n"
+        "Allowed output format only:\n"
+        "Host A: <text>\n"
+        "Host B: <text>\n\n"
+        "Paper content:\n"
+        f"{llm_input}"
+    )
+
+    raw = llm_client.generate_text(
+        system_prompt=HIGH_DETAIL_DIALOGUE_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        temperature=temperature,
+        max_output_tokens=max(256, int(max_output_tokens)),
+        thinking_budget_tokens=max(0, int(thinking_budget_tokens)),
+        enable_extended_thinking=(thinking_budget_tokens > 0),
+    )
+    lines = _normalize_dialogue(raw)
+
+    if len(lines) < max(24, dialogue_turns):
+        retry_prompt = (
+            f"{user_prompt}\n\n"
+            "Quality update:\n"
+            "- Expand background context and methods in more depth.\n"
+            "- Explain all equations with explicit equation numbers when present.\n"
+            "- Keep strict Host A / Host B formatting."
+        )
+        retry_raw = llm_client.generate_text(
+            system_prompt=HIGH_DETAIL_DIALOGUE_SYSTEM_PROMPT,
+            user_prompt=retry_prompt,
+            temperature=temperature,
+            max_output_tokens=max(256, int(max_output_tokens)),
+            thinking_budget_tokens=max(0, int(thinking_budget_tokens)),
+            enable_extended_thinking=(thinking_budget_tokens > 0),
+        )
+        retry_lines = _normalize_dialogue(retry_raw)
+        if len(retry_lines) > len(lines):
+            lines = retry_lines
+
+    return lines
+
+
 def generate_dialogue_text(
     *,
     paper_name: str,
@@ -576,12 +777,8 @@ def generate_dialogue_text(
 ) -> str:
     """Generate normalized Host A/B dialogue text."""
     detail = detail_level.strip().lower()
-    if detail not in {"default", "high"}:
-        raise LLMWriterError("DETAIL_LEVEL must be 'Default' or 'High'.")
-
-    system_prompt = (
-        HIGH_DETAIL_DIALOGUE_SYSTEM_PROMPT if detail == "high" else DEFAULT_DIALOGUE_SYSTEM_PROMPT
-    )
+    if detail not in {"default", "medium", "high"}:
+        raise LLMWriterError("DETAIL_LEVEL must be 'Default', 'Medium', or 'High'.")
 
     client = _build_llm_client(
         provider=llm_provider,
@@ -598,45 +795,46 @@ def generate_dialogue_text(
         logger=logger,
     )
 
-    user_prompt = (
-        f"Paper title: {paper_name}\n\n"
-        f"Generate approximately {dialogue_turns} turns total.\n"
-        "Allowed output format only:\n"
-        "Host A: <text>\n"
-        "Host B: <text>\n\n"
-        "Paper content:\n"
-        f"{llm_input}"
-    )
-
-    raw = client.generate_text(
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        temperature=temperature,
-        max_output_tokens=max(256, int(max_output_tokens)),
-        thinking_budget_tokens=max(0, int(thinking_budget_tokens)),
-        enable_extended_thinking=(thinking_budget_tokens > 0),
-    )
-    lines = _normalize_dialogue(raw)
-
-    if detail == "high" and len(lines) < max(24, dialogue_turns):
-        retry_prompt = (
-            f"{user_prompt}\n\n"
-            "Quality update:\n"
-            "- Expand background context and methods in more depth.\n"
-            "- Explain all equations with explicit equation numbers when present.\n"
-            "- Keep strict Host A / Host B formatting."
+    if detail == "high":
+        lines = _generate_high_detail_macro_chunks(
+            llm_client=client,
+            paper_name=paper_name,
+            llm_input=llm_input,
+            dialogue_turns=dialogue_turns,
+            temperature=temperature,
+            max_output_tokens=max(256, int(max_output_tokens)),
+            thinking_budget_tokens=max(0, int(thinking_budget_tokens)),
+            logger=logger,
         )
-        retry_raw = client.generate_text(
-            system_prompt=HIGH_DETAIL_DIALOGUE_SYSTEM_PROMPT,
-            user_prompt=retry_prompt,
+    elif detail == "medium":
+        lines = _generate_medium_detail_dialogue(
+            llm_client=client,
+            paper_name=paper_name,
+            llm_input=llm_input,
+            dialogue_turns=dialogue_turns,
+            temperature=temperature,
+            max_output_tokens=max(256, int(max_output_tokens)),
+            thinking_budget_tokens=max(0, int(thinking_budget_tokens)),
+        )
+    else:
+        user_prompt = (
+            f"Paper title: {paper_name}\n\n"
+            f"Generate approximately {dialogue_turns} turns total.\n"
+            "Allowed output format only:\n"
+            "Host A: <text>\n"
+            "Host B: <text>\n\n"
+            "Paper content:\n"
+            f"{llm_input}"
+        )
+        raw = client.generate_text(
+            system_prompt=DEFAULT_DIALOGUE_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
             temperature=temperature,
             max_output_tokens=max(256, int(max_output_tokens)),
             thinking_budget_tokens=max(0, int(thinking_budget_tokens)),
             enable_extended_thinking=(thinking_budget_tokens > 0),
         )
-        retry_lines = _normalize_dialogue(retry_raw)
-        if len(retry_lines) > len(lines):
-            lines = retry_lines
+        lines = _normalize_dialogue(raw)
 
     return "\n".join(lines)
 
