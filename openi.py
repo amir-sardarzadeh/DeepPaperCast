@@ -33,11 +33,11 @@ from tts_audio import TTSAudioError, synthesize_audio_from_dialogue
 #   You can still override at runtime using CLI flags.
 # - EXTENDED_THINKING_ALWAYS_ON keeps reasoning mode enabled for all runs.
 
-File = "Bayesian_Koopman_Time_Series_Forecasting.pdf"
+File = "PhyloTextDiff Text-Based Discrete Diffusion for Generative Phylogenetic Inference.pdf"
 DETAIL_LEVEL = "High"
-Company = "Claude"
-Model = "claude-opus-4-6"
-API_WRITER_FILE = "apit.txt"
+Company = "OpenAI"
+Model = "gpt-5.4-pro"
+API_WRITER_FILE = "apiv.txt"
 API_VOICE_FILE = "apiv.txt"
 FINAL_ROOT = "Final"
 EXTENDED_THINKING_ALWAYS_ON = True

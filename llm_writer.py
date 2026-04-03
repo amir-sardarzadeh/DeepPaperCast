@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """LLM + PDF utilities for dialogue and explanation generation."""
 
 from __future__ import annotations
@@ -7,6 +7,19 @@ import logging
 import re
 from pathlib import Path
 from typing import Dict, List, Optional
+
+FORMULA_EXPLANATION_POLICY = """
+- Formula Narration Rules:
+- Never read an equation verbatim or as a stream of symbols.
+- Never say raw notation such as "E equals one over r cubed", "sigma sub i", "x hat", or long chains of Greek letters unless a symbol name is absolutely necessary.
+- When a formula appears, first state what physical, statistical, or algorithmic relationship it expresses.
+- Then explain what each important term means in plain language.
+- Then give an intuitive analogy, geometric picture, or real-world interpretation.
+- Mention the equation number explicitly when one is available, but do not recite the equation after naming it.
+- If the equation is dense, summarize the dependency or tradeoff it encodes instead of reading notation.
+- Preferred style example: instead of saying "Equation 7 says E equals one over r cubed", say "Equation 7 says the field dies off extremely quickly with distance; if you move away from the source, the strength collapses roughly with the cube of distance, so small increases in distance produce a much weaker effect."
+- Another preferred style example: instead of saying "y equals H x plus n", say "This is the standard measurement model: the system mixes the underlying signal through the channel, and then random noise gets added on top before we observe it."
+"""
 
 DEFAULT_DIALOGUE_SYSTEM_PROMPT = """You are a world-class podcast producer and scriptwriter.
 Write a lively, engaging two-person podcast transcript between Host A and Host B about the provided academic paper.
@@ -17,11 +30,11 @@ Requirements:
 - Cover: problem, methodology, key findings, limitations, and practical implications.
 - Formula Handling: If there are simple, foundational formulas, explain them intuitively using physical or visual analogies. Skip over highly complex, impenetrable math and just focus on the resulting concepts.
 - Keep each speaking turn short and punchy (1-3 sentences maximum).
-- Audio/TTS Constraints: DO NOT use emojis, markdown, bullet points, stage directions, or narrator notes. Spell out symbols.
+- Audio/TTS Constraints: DO NOT use emojis, markdown, bullet points, stage directions, or narrator notes. Do not read notation symbol-by-symbol; convert it into natural spoken explanation.
 - STRICT FORMAT: Every single line must begin with exactly "Host A:" or "Host B:".
 """
 
-HIGH_DETAIL_DIALOGUE_SYSTEM_PROMPT = """You are a world-class podcast producer and scriptwriter.
+HIGH_DETAIL_DIALOGUE_SYSTEM_PROMPT = f"""You are a world-class podcast producer and scriptwriter.
 Write a highly comprehensive, extended-length, two-person podcast transcript between Host A and Host B about the provided academic paper.
 
 Requirements:
@@ -29,7 +42,8 @@ Requirements:
 - Detail the methodology step-by-step. Discuss why the authors chose this approach and alternatives.
 - Host A acts as the expert guide. Host B acts as the highly curious learner asking probing follow-up questions.
 - STRICT Formula Handling: You MUST explain all formulas presented in the paper. When discussing a formula, you must explicitly state its number as it appears in the text (for example: "If we look at Equation 4..."). Translate these complex equations into physical, visual, or relatable analogies so they make sense in an audio format. DO NOT just read the raw math symbols.
-- Audio/TTS Constraints: DO NOT use emojis, markdown, bullet points, stage directions, or narrator notes. Spell out symbols.
+{FORMULA_EXPLANATION_POLICY}
+- Audio/TTS Constraints: DO NOT use emojis, markdown, bullet points, stage directions, or narrator notes. Do not read notation symbol-by-symbol; convert it into natural spoken explanation.
 - STRICT FORMAT: Every single line must begin with exactly "Host A:" or "Host B:".
 """
 
@@ -48,7 +62,7 @@ Requirements:
 - STRICT FORMAT: Every single line must begin with exactly "Host A:" or "Host B:".
 """
 
-HIGH_DETAIL_PART2_SYSTEM_PROMPT = """You are a world-class podcast producer and scriptwriter. You are writing Part 2 of 3 of an ongoing podcast about the provided academic paper.
+HIGH_DETAIL_PART2_SYSTEM_PROMPT = f"""You are a world-class podcast producer and scriptwriter. You are writing Part 2 of 3 of an ongoing podcast about the provided academic paper.
 
 Below is the entire transcript of Part 1.
 
@@ -59,12 +73,13 @@ Requirements:
 - DO NOT repeat introductions, greetings, or background information already covered in Part 1. Pick up the dialogue exactly where the previous text left off.
 - Maximize your output. Detail the methodology step-by-step. Discuss why the authors chose this approach and what the alternatives were.
 - STRICT Formula Handling: You MUST explain the core formulas presented in the paper. State the equation number explicitly (for example: "Looking at Equation 4..."). Translate these equations into relatable physical or visual analogies. DO NOT just read raw math symbols.
+{FORMULA_EXPLANATION_POLICY}
 - DO NOT cover the final experimental results or real-world implications yet.
 - DO NOT conclude the episode. End on a transition leading toward the results.
 - STRICT FORMAT: Every single line must begin with exactly "Host A:" or "Host B:".
 """
 
-HIGH_DETAIL_PART3_SYSTEM_PROMPT = """You are a world-class podcast producer and scriptwriter. You are writing Part 3 of 3, the final segment of an ongoing podcast about the provided academic paper.
+HIGH_DETAIL_PART3_SYSTEM_PROMPT = f"""You are a world-class podcast producer and scriptwriter. You are writing Part 3 of 3, the final segment of an ongoing podcast about the provided academic paper.
 
 Below is the entire accumulated transcript of Parts 1 and 2.
 
@@ -75,6 +90,7 @@ Requirements:
 - DO NOT repeat the background or methodology. Pick up the dialogue exactly where Part 2 left off.
 - Maximize your output to thoroughly unpack the data and what it actually means for the future of the field.
 - Once the results and limitations have been thoroughly explored, guide the hosts to a natural, engaging outro and conclude the episode.
+- If you briefly refer back to an earlier equation while interpreting the results, keep following the same meaning-first explanation style and do not recite notation.
 - STRICT FORMAT: Every single line must begin with exactly "Host A:" or "Host B:".
 """
 
@@ -657,6 +673,7 @@ def _generate_high_detail_macro_chunks(
         "Continue from the transcript below.\n\n"
         "[FULL_TRANSCRIPT_SO_FAR]\n"
         f"{transcript_so_far}\n\n"
+        "Critical reminder for this part: when you reach equations, explain them in meaning-first audio language. Do not read formulas or symbol strings aloud.\n\n"
         "Paper content:\n"
         f"{llm_input}"
     )
@@ -741,6 +758,7 @@ def _generate_medium_detail_dialogue(
             "Quality update:\n"
             "- Expand background context and methods in more depth.\n"
             "- Explain all equations with explicit equation numbers when present.\n"
+            "- Never read formulas aloud as symbol strings; explain what each equation means in plain language first.\n"
             "- Keep strict Host A / Host B formatting."
         )
         retry_raw = llm_client.generate_text(
