@@ -107,7 +107,7 @@ Return concise plain text with these headings:
 
 SPEAKER_RE = re.compile(r"^(Host\s*A|Host\s*B|Person\s*A|Person\s*B)\s*:\s*(.*)$", re.IGNORECASE)
 INVALID_FILENAME_CHARS = re.compile(r"[<>:\"/\\|?*\x00-\x1F]")
-ANTHROPIC_STREAMING_MAX_TOKENS_THRESHOLD = 21333
+ANTHROPIC_NON_STREAMING_MAX_TOKENS_FALLBACK = 21333
 
 
 class LLMWriterError(RuntimeError):
@@ -280,7 +280,7 @@ class OpenAIResponsesClient(BaseLLMClient):
 
 
 class AnthropicMessagesClient(BaseLLMClient):
-    """Anthropic Messages API wrapper with automatic streaming for large calls."""
+    """Anthropic Messages API wrapper using non-streaming responses."""
 
     def __init__(self, *, model: str, api_key: str, logger: logging.Logger) -> None:
         try:
@@ -293,8 +293,8 @@ class AnthropicMessagesClient(BaseLLMClient):
         self.logger = logger
 
     @staticmethod
-    def _is_streaming_required_error(exc: Exception) -> bool:
-        return "streaming is required" in str(exc).lower()
+    def _is_streaming_required_error(error_text: str) -> bool:
+        return "streaming is required" in error_text.lower()
 
     @staticmethod
     def _extract_max_tokens_limit(error_text: str) -> Optional[int]:
@@ -331,6 +331,30 @@ class AnthropicMessagesClient(BaseLLMClient):
         thinking_obj["budget_tokens"] = budget
         payload["thinking"] = thinking_obj
 
+    def _apply_non_streaming_cap_from_error(self, payload: Dict[str, object], error_text: str) -> bool:
+        """Reduce max_tokens when Anthropic rejects non-streaming requests."""
+        if not self._is_streaming_required_error(error_text):
+            return False
+
+        current = int(payload.get("max_tokens", 0) or 0)
+        if current <= 1024:
+            return False
+
+        parsed_cap = self._extract_max_tokens_limit(error_text)
+        if parsed_cap and parsed_cap < current:
+            cap = parsed_cap
+        elif current > ANTHROPIC_NON_STREAMING_MAX_TOKENS_FALLBACK:
+            cap = ANTHROPIC_NON_STREAMING_MAX_TOKENS_FALLBACK
+        else:
+            cap = max(1024, current // 2)
+
+        if cap >= current:
+            return False
+
+        payload["max_tokens"] = cap
+        self._normalize_thinking_payload(payload)
+        return True
+
     def _apply_token_cap_from_error(self, payload: Dict[str, object], error_text: str) -> bool:
         """
         Apply automatic payload fixes from token-related API errors.
@@ -340,6 +364,9 @@ class AnthropicMessagesClient(BaseLLMClient):
         cap = self._extract_max_tokens_limit(error_text)
         if cap and int(payload.get("max_tokens", 0) or 0) > cap:
             payload["max_tokens"] = cap
+            changed = True
+
+        if self._apply_non_streaming_cap_from_error(payload, error_text):
             changed = True
 
         if self._is_thinking_budget_relation_error(error_text):
@@ -357,13 +384,8 @@ class AnthropicMessagesClient(BaseLLMClient):
 
         return changed
 
-    def _send(self, payload: Dict[str, object], force_stream: bool = False) -> object:
-        max_tokens = int(payload.get("max_tokens", 0) or 0)
-        use_stream = force_stream or max_tokens >= ANTHROPIC_STREAMING_MAX_TOKENS_THRESHOLD
-        if use_stream:
-            self.logger.info("Using Anthropic streaming API. max_tokens=%d", max_tokens)
-            with self.client.messages.stream(**payload) as stream:
-                return stream.get_final_message()
+    def _send(self, payload: Dict[str, object]) -> object:
+        self.logger.debug("Using Anthropic non-streaming API. max_tokens=%s", payload.get("max_tokens"))
         return self.client.messages.create(**payload)
 
     def generate_text(
@@ -408,6 +430,8 @@ class AnthropicMessagesClient(BaseLLMClient):
             recovered = False
             error_text = str(exc)
             if self._apply_token_cap_from_error(payload, error_text):
+                if "thinking" not in payload and "temperature" not in payload:
+                    payload["temperature"] = temperature
                 self.logger.warning(
                     "Anthropic request rejected by token constraints (%s). Retrying with max_tokens=%s%s.",
                     exc,
@@ -442,11 +466,6 @@ class AnthropicMessagesClient(BaseLLMClient):
                             raise LLMWriterError(f"Anthropic API error: {final_retry_exc}") from final_retry_exc
                     else:
                         raise LLMWriterError(f"Anthropic API error: {retry_exc}") from retry_exc
-            elif self._is_streaming_required_error(exc):
-                try:
-                    message = self._send(payload, force_stream=True)
-                except Exception as stream_exc:  # noqa: BLE001
-                    raise LLMWriterError(f"Anthropic API error: {stream_exc}") from stream_exc
             else:
                 raise LLMWriterError(f"Anthropic API error: {exc}") from exc
 

@@ -129,7 +129,7 @@ pdflatex --version
 ## Notes
 
 - Large token budgets can be slow and expensive.
-- Anthropic large requests automatically use streaming in this codebase.
+- Anthropic requests in the writer pipeline use non-streaming responses; if a request exceeds non-streaming limits, token budgets are auto-clamped and retried.
 - Anthropic token budgets are auto-clamped to model limits and valid thinking/output relationships.
 - Audio stitching uses `ffmpeg` directly (no `pydub` dependency), which avoids Python 3.14 `audioop` issues.
 - Keep real keys local; do not commit `apit.txt`, `apiv.txt`, or `api.txt`.
