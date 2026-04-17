@@ -15,6 +15,7 @@ Final/<paper_name>/
 
 - `main.py`: full pipeline (PDF -> transcript -> TTS segments -> stitched audio)
 - `llm_writer.py`: shared writer module for main flow (PDF extraction + dialogue generation)
+- `emotion.py`: optional middleware that adds Grok speech tags while validating that spoken words are unchanged
 - `tts_audio.py`: TTS generation, persistent `voice_segments/`, and stitching
 - `script_only.py`: standalone transcript-only pipeline (no TTS, no dependency on `llm_writer.py`)
 - `latex.py`: standalone LaTeX explainer pipeline (`.tex` + compiled PDF)
@@ -44,7 +45,7 @@ Install Python packages:
 python -m pip install -r requirements.txt
 ```
 
-## API Keys (`apit.txt` + `apiv.txt`)
+## API Keys (`apit.txt` + `apiv.txt` + `xapi.txt`)
 
 Create these files in project root:
 
@@ -57,12 +58,20 @@ OPENAI_API_KEY=your_openai_key_if_using_openai_writer
 ```txt
 # apiv.txt (voice generation)
 OPENAI_API_KEY=your_openai_key
+# XAI_API_KEY=your_xai_key_if_using_grok_tts
+```
+
+```txt
+# xapi.txt (recommended for Grok/xAI TTS)
+XAI_API_KEY=your_xai_key
 ```
 
 Notes:
 - `main.py` uses:
   - `apit.txt` for writer (`llm_writer.py`)
-  - `apiv.txt` for voice (`tts_audio.py`)
+  - `apit.txt` for `emotion.py` (Claude-based tag insertion when enabled)
+  - `apiv.txt` for OpenAI voice (`tts_audio.py`)
+  - `xapi.txt` for Grok/xAI voice by default (`--api-grok-file`)
 - `script_only.py` and `latex.py` are text-only and default to `apit.txt`.
 
 ## Quick Start
@@ -74,6 +83,13 @@ Edit config at top of `main.py` (or pass CLI args), then run:
 ```powershell
 python main.py
 ```
+
+Useful flags:
+- `--tts-provider openai|grok`
+- `--tts-model ...`
+- `--tts-language en|auto|...` (used by Grok TTS)
+- `--host-a-voice ... --host-b-voice ...`
+- `--emotion/--no-emotion`
 
 `DETAIL_LEVEL` options in `main.py`:
 - `Default`: concise podcast script
@@ -129,7 +145,11 @@ pdflatex --version
 ## Notes
 
 - Large token budgets can be slow and expensive.
-- Anthropic requests in the writer pipeline use non-streaming responses; if a request exceeds non-streaming limits, token budgets are auto-clamped and retried.
+- Anthropic large requests automatically use streaming in `llm_writer.py` and `latex.py`.
 - Anthropic token budgets are auto-clamped to model limits and valid thinking/output relationships.
+- Claude Opus 4.7 support is included (`claude-opus-4-7`) with 1M context and 128k max output in the synchronous Messages API profile.
+- For Claude Opus 4.7, this codebase uses adaptive thinking (`thinking: {"type":"adaptive"}`) and omits non-default sampling params (e.g., `temperature`) to match current API requirements.
+- Grok TTS uses `POST https://api.x.ai/v1/tts` and supports expressive speech tags.
+- In `main.py`, Grok TTS defaults to `Host A=ARA` and `Host B=EVE`.
 - Audio stitching uses `ffmpeg` directly (no `pydub` dependency), which avoids Python 3.14 `audioop` issues.
 - Keep real keys local; do not commit `apit.txt`, `apiv.txt`, or `api.txt`.

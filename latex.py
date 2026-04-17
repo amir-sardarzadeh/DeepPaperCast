@@ -15,15 +15,16 @@ from typing import Dict, List, Optional
 # Quick-start config (edit then run: python latex.py)
 DETAIL_LEVEL = "High"
 Company = "Claude"
-Model = "claude-sonnet-4-6"
+Model = "claude-opus-4-7"
 API_FILE = "apit.txt"
 FINAL_ROOT = "Final"
 File = "3.pdf"
 
 SUPPORTED_MODELS = {
+    "claude-opus-4-7": {"provider": "anthropic", "max_context_tokens": 1_000_000, "max_output_tokens": 128_000, "supports_extended_thinking": True},
     "claude-3-7-sonnet-latest": {"provider": "anthropic", "max_context_tokens": 200_000, "max_output_tokens": 128_000, "supports_extended_thinking": True},
     "claude-opus-4-6": {"provider": "anthropic", "max_context_tokens": 200_000, "max_output_tokens": 128_000, "supports_extended_thinking": True},
-    "claude-sonnet-4-6": {"provider": "anthropic", "max_context_tokens": 200_000, "max_output_tokens": 128_000, "supports_extended_thinking": True},
+    "claude-sonnet-4-6": {"provider": "anthropic", "max_context_tokens": 1_000_000, "max_output_tokens": 64_000, "supports_extended_thinking": True},
     "gpt-4o": {"provider": "openai", "max_context_tokens": 128_000, "max_output_tokens": 16384, "supports_extended_thinking": False},
     "gpt-4o-latest": {"provider": "openai", "max_context_tokens": 128_000, "max_output_tokens": 16384, "supports_extended_thinking": False},
 }
@@ -192,6 +193,19 @@ def _resolve_provider(company: str) -> str:
     raise LatexError("Company must be OpenAI or Claude.")
 
 
+def _normalize_model_for_provider(provider: str, model: str) -> str:
+    m = (model or "").strip()
+    lowered = m.lower()
+    if provider == "anthropic":
+        if lowered in {"opus 4.7", "claude opus 4.7", "claude-opus-4.7"}:
+            return "claude-opus-4-7"
+        if lowered in {"opus", "opus 4.6", "claude opus", "claude-opus"}:
+            return "claude-opus-4-6"
+        if lowered in {"sonnet", "claude sonnet", "claude-sonnet"}:
+            return "claude-3-7-sonnet-latest"
+    return m
+
+
 def _lookup_model_profile(model_name: str, provider: str) -> Dict[str, object]:
     for key, value in SUPPORTED_MODELS.items():
         if key.lower() == model_name.lower():
@@ -294,9 +308,16 @@ class AnthropicMessagesClient(BaseLLMClient):
         self.client = anthropic.Anthropic(api_key=api_key)
         self.model = model
 
-    def _send(self, payload: Dict[str, object]) -> object:
+    def _is_opus_4_7_model(self) -> bool:
+        return "claude-opus-4-7" in self.model.lower()
+
+    @staticmethod
+    def _is_streaming_required_error(exc: Exception) -> bool:
+        return "streaming is required" in str(exc).lower()
+
+    def _send(self, payload: Dict[str, object], force_stream: bool = False) -> object:
         max_tokens = int(payload.get("max_tokens", 0) or 0)
-        if max_tokens >= ANTHROPIC_STREAMING_MAX_TOKENS_THRESHOLD:
+        if force_stream or max_tokens >= ANTHROPIC_STREAMING_MAX_TOKENS_THRESHOLD:
             with self.client.messages.stream(**payload) as stream:
                 return stream.get_final_message()
         return self.client.messages.create(**payload)
@@ -311,27 +332,65 @@ class AnthropicMessagesClient(BaseLLMClient):
         thinking_budget_tokens: int,
         enable_extended_thinking: bool,
     ) -> str:
+        max_output_tokens = max(256, int(max_output_tokens))
+        thinking_budget_tokens = max(0, int(thinking_budget_tokens))
+        if thinking_budget_tokens >= max_output_tokens:
+            thinking_budget_tokens = max_output_tokens - 1
+        if 0 < thinking_budget_tokens < 1024:
+            thinking_budget_tokens = 0
+
         payload: Dict[str, object] = {
             "model": self.model,
             "system": system_prompt,
             "messages": [{"role": "user", "content": user_prompt}],
             "max_tokens": max_output_tokens,
         }
-        if enable_extended_thinking and thinking_budget_tokens > 0:
-            payload["thinking"] = {"type": "enabled", "budget_tokens": int(thinking_budget_tokens)}
+        use_thinking = enable_extended_thinking and thinking_budget_tokens > 0
+        if use_thinking:
+            if self._is_opus_4_7_model():
+                payload["thinking"] = {"type": "adaptive"}
+                payload["output_config"] = {"effort": "xhigh"}
+                if temperature != 1.0:
+                    logging.getLogger("latex").warning(
+                        "Ignoring temperature=%s for %s because non-default sampling params are unsupported.",
+                        temperature,
+                        self.model,
+                    )
+            else:
+                payload["thinking"] = {"type": "enabled", "budget_tokens": int(thinking_budget_tokens)}
         else:
-            payload["temperature"] = temperature
+            if self._is_opus_4_7_model():
+                if temperature != 1.0:
+                    logging.getLogger("latex").warning(
+                        "Ignoring temperature=%s for %s because non-default sampling params are unsupported.",
+                        temperature,
+                        self.model,
+                    )
+            else:
+                payload["temperature"] = temperature
 
         try:
             message = self._send(payload)
         except Exception as exc:  # noqa: BLE001
-            if "thinking" in payload:
+            if self._is_streaming_required_error(exc):
+                try:
+                    message = self._send(payload, force_stream=True)
+                except Exception as stream_exc:  # noqa: BLE001
+                    raise LatexError(f"Anthropic API error: {stream_exc}") from stream_exc
+            elif "thinking" in payload:
                 payload.pop("thinking", None)
-                payload["temperature"] = temperature
+                if not self._is_opus_4_7_model():
+                    payload["temperature"] = temperature
                 try:
                     message = self._send(payload)
                 except Exception as retry_exc:  # noqa: BLE001
-                    raise LatexError(f"Anthropic API error: {retry_exc}") from retry_exc
+                    if self._is_streaming_required_error(retry_exc):
+                        try:
+                            message = self._send(payload, force_stream=True)
+                        except Exception as stream_retry_exc:  # noqa: BLE001
+                            raise LatexError(f"Anthropic API error: {stream_retry_exc}") from stream_retry_exc
+                    else:
+                        raise LatexError(f"Anthropic API error: {retry_exc}") from retry_exc
             else:
                 raise LatexError(f"Anthropic API error: {exc}") from exc
 
@@ -402,7 +461,7 @@ def run() -> int:
             pdf_path = (root_dir / pdf_path).resolve()
 
         provider = _resolve_provider(args.company)
-        model = args.model
+        model = _normalize_model_for_provider(provider, args.model)
 
         boot_logger = logging.getLogger("latex_boot")
         boot_logger.setLevel(logging.INFO)

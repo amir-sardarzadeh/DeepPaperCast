@@ -3,6 +3,7 @@
 
 # If Company = "Claude"
 ANTHROPIC_API_KEY=your_anthropic_key_here
+# Note: emotion.py uses Anthropic (Claude) when enabled for Grok TTS.
 
 # If Company = "OpenAI"
 # OPENAI_API_KEY=your_openai_key_here

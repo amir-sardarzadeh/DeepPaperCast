@@ -9,9 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List
 
+import requests
+
 SPEAKER_RE = re.compile(r"^(Host\s*A|Host\s*B|Person\s*A|Person\s*B)\s*:\s*(.*)$", re.IGNORECASE)
 TARGET_SAMPLE_RATE_HZ = 48_000
 TARGET_MP3_BITRATE = "320k"
+GROK_TTS_ENDPOINT = "https://api.x.ai/v1/tts"
 
 
 def _ffmpeg_concat_entry(path: Path) -> str:
@@ -151,18 +154,79 @@ def _synthesize_openai_tts_segment(
         raise TTSAudioError(f"OpenAI TTS request failed for {output_path.name}: {exc}") from exc
 
 
+def _synthesize_grok_tts_segment(
+    *,
+    api_key: str,
+    voice: str,
+    text: str,
+    language: str,
+    output_path: Path,
+    logger: logging.Logger,
+) -> None:
+    """Synthesize one segment with xAI Grok TTS and save it to disk."""
+    payload = {
+        "text": text,
+        "voice_id": voice.lower(),
+        "language": language,
+        "output_format": {
+            "codec": "mp3",
+            "sample_rate": TARGET_SAMPLE_RATE_HZ,
+            "bit_rate": 192000,
+        },
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    logger.debug("Generating Grok TTS segment: %s", output_path.name)
+    try:
+        response = requests.post(
+            GROK_TTS_ENDPOINT,
+            headers=headers,
+            json=payload,
+            timeout=180,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise TTSAudioError(f"Grok TTS request failed for {output_path.name}: {exc}") from exc
+
+    if response.status_code >= 400:
+        body = (response.text or "").strip()
+        body_tail = body[-800:] if body else "No response body."
+        raise TTSAudioError(
+            f"Grok TTS request failed for {output_path.name} with HTTP {response.status_code}: {body_tail}"
+        )
+
+    if not response.content:
+        raise TTSAudioError(f"Grok TTS request returned empty audio for {output_path.name}.")
+
+    output_path.write_bytes(response.content)
+
+
 def synthesize_voice_segments(
     *,
     turns: List[DialogueTurn],
     api_keys: Dict[str, str],
+    tts_provider: str,
     tts_model: str,
     host_a_voice: str,
     host_b_voice: str,
+    tts_language: str,
     segments_dir: Path,
     logger: logging.Logger,
 ) -> List[Path]:
     """Generate per-line/per-chunk audio files and persist them in voice_segments/."""
-    api_key = _get_api_key(api_keys, ["OPENAI_API_KEY", "OPENAI"])
+    provider = (tts_provider or "").strip().lower()
+    if provider == "openai":
+        api_key = _get_api_key(api_keys, ["OPENAI_API_KEY", "OPENAI"])
+    elif provider in {"grok", "xai", "x.ai"}:
+        api_key = _get_api_key(api_keys, ["XAI_API_KEY", "XAI", "GROK_API_KEY", "GROK"])
+        provider = "grok"
+        if tts_model:
+            logger.debug("Ignoring tts_model=%s for Grok TTS; xAI /v1/tts voice_id drives synthesis.", tts_model)
+    else:
+        raise TTSAudioError(f"Unsupported TTS provider: {tts_provider}")
+
     segments_dir.mkdir(parents=True, exist_ok=True)
 
     segment_paths: List[Path] = []
@@ -180,14 +244,24 @@ def synthesize_voice_segments(
             if segment_path.exists() and segment_path.stat().st_size > 0:
                 logger.info("Reusing existing segment: %s", segment_path.name)
             else:
-                _synthesize_openai_tts_segment(
-                    api_key=api_key,
-                    tts_model=tts_model,
-                    voice=voice,
-                    text=chunk,
-                    output_path=segment_path,
-                    logger=logger,
-                )
+                if provider == "openai":
+                    _synthesize_openai_tts_segment(
+                        api_key=api_key,
+                        tts_model=tts_model,
+                        voice=voice,
+                        text=chunk,
+                        output_path=segment_path,
+                        logger=logger,
+                    )
+                else:
+                    _synthesize_grok_tts_segment(
+                        api_key=api_key,
+                        voice=voice,
+                        text=chunk,
+                        language=tts_language,
+                        output_path=segment_path,
+                        logger=logger,
+                    )
                 logger.info("Saved segment: %s", segment_path.name)
             segment_paths.append(segment_path)
             segment_idx += 1
@@ -258,9 +332,11 @@ def synthesize_audio_from_dialogue(
     *,
     dialogue_path: Path,
     api_keys: Dict[str, str],
+    tts_provider: str,
     tts_model: str,
     host_a_voice: str,
     host_b_voice: str,
+    tts_language: str,
     output_dir: Path,
     logger: logging.Logger,
 ) -> Path:
@@ -271,9 +347,11 @@ def synthesize_audio_from_dialogue(
     synthesize_voice_segments(
         turns=turns,
         api_keys=api_keys,
+        tts_provider=tts_provider,
         tts_model=tts_model,
         host_a_voice=host_a_voice,
         host_b_voice=host_b_voice,
+        tts_language=tts_language,
         segments_dir=segments_dir,
         logger=logger,
     )

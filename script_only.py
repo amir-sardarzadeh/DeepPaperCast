@@ -14,17 +14,18 @@ from typing import Dict, List, Optional, Tuple
 # Quick-start config (edit then run: python script_only.py)
 DETAIL_LEVEL = "High"
 Company = "Claude"
-Model = "claude-opus-4-6"
+Model = "claude-opus-4-7"
 API_FILE = "apit.txt"
 FINAL_ROOT = "Final"
 File = "Channel_Parameter_Estimation_and_Localization_for_Near-field_XL-MIMO_Communications.pdf"
 
 SUPPORTED_MODELS = {
-    "claude-3-7-sonnet-latest": {"provider": "anthropic", "max_context_tokens": 200_000, "supports_extended_thinking": True},
-    "claude-opus-4-6": {"provider": "anthropic", "max_context_tokens": 200_000, "supports_extended_thinking": True},
-    "claude-sonnet-4-6": {"provider": "anthropic", "max_context_tokens": 200_000, "supports_extended_thinking": True},
-    "gpt-4o": {"provider": "openai", "max_context_tokens": 128_000, "supports_extended_thinking": False},
-    "gpt-4o-latest": {"provider": "openai", "max_context_tokens": 128_000, "supports_extended_thinking": False},
+    "claude-opus-4-7": {"provider": "anthropic", "max_context_tokens": 1_000_000, "max_output_tokens": 128_000, "supports_extended_thinking": True},
+    "claude-3-7-sonnet-latest": {"provider": "anthropic", "max_context_tokens": 200_000, "max_output_tokens": 128_000, "supports_extended_thinking": True},
+    "claude-opus-4-6": {"provider": "anthropic", "max_context_tokens": 200_000, "max_output_tokens": 128_000, "supports_extended_thinking": True},
+    "claude-sonnet-4-6": {"provider": "anthropic", "max_context_tokens": 1_000_000, "max_output_tokens": 64_000, "supports_extended_thinking": True},
+    "gpt-4o": {"provider": "openai", "max_context_tokens": 128_000, "max_output_tokens": 16_384, "supports_extended_thinking": False},
+    "gpt-4o-latest": {"provider": "openai", "max_context_tokens": 128_000, "max_output_tokens": 16_384, "supports_extended_thinking": False},
 }
 
 DEFAULT_DIALOGUE_SYSTEM_PROMPT = """You are a world-class podcast producer and scriptwriter.
@@ -65,7 +66,7 @@ Return concise plain text with these headings:
 
 SPEAKER_RE = re.compile(r"^(Host\s*A|Host\s*B|Person\s*A|Person\s*B)\s*:\s*(.*)$", re.IGNORECASE)
 INVALID_FILENAME_CHARS = re.compile(r"[<>:\"/\\|?*\x00-\x1F]")
-ANTHROPIC_NON_STREAMING_MAX_TOKENS_FALLBACK = 21333
+ANTHROPIC_STREAMING_MAX_TOKENS_THRESHOLD = 21333
 
 
 class ScriptOnlyError(RuntimeError):
@@ -216,6 +217,19 @@ def _resolve_provider(company: str) -> str:
     raise ScriptOnlyError("Company must be OpenAI or Claude.")
 
 
+def _normalize_model_for_provider(provider: str, model: str) -> str:
+    m = (model or "").strip()
+    lowered = m.lower()
+    if provider == "anthropic":
+        if lowered in {"opus 4.7", "claude opus 4.7", "claude-opus-4.7"}:
+            return "claude-opus-4-7"
+        if lowered in {"opus", "opus 4.6", "claude opus", "claude-opus"}:
+            return "claude-opus-4-6"
+        if lowered in {"sonnet", "claude sonnet", "claude-sonnet"}:
+            return "claude-3-7-sonnet-latest"
+    return m
+
+
 def _lookup_model_profile(model_name: str, provider: str) -> Dict[str, object]:
     for key, value in SUPPORTED_MODELS.items():
         if key.lower() == model_name.lower():
@@ -223,6 +237,7 @@ def _lookup_model_profile(model_name: str, provider: str) -> Dict[str, object]:
     return {
         "provider": provider,
         "max_context_tokens": 200_000 if provider == "anthropic" else 128_000,
+        "max_output_tokens": 128_000 if provider == "anthropic" else 16_384,
         "supports_extended_thinking": provider == "anthropic",
     }
 
@@ -325,6 +340,9 @@ class AnthropicMessagesClient(BaseLLMClient):
         self.model = model
         self.logger = logger
 
+    def _is_opus_4_7_model(self) -> bool:
+        return "claude-opus-4-7" in self.model.lower()
+
     @staticmethod
     def _extract_max_tokens_limit(error_text: str) -> Optional[int]:
         match = re.search(r"max_tokens:\s*\d+\s*>\s*(\d+)", error_text, flags=re.IGNORECASE)
@@ -349,6 +367,8 @@ class AnthropicMessagesClient(BaseLLMClient):
         thinking_obj = payload.get("thinking")
         if not isinstance(thinking_obj, dict):
             return
+        if str(thinking_obj.get("type", "")).lower() != "enabled":
+            return
 
         budget = int(thinking_obj.get("budget_tokens", 0) or 0)
         if budget >= max_tokens:
@@ -359,37 +379,11 @@ class AnthropicMessagesClient(BaseLLMClient):
         thinking_obj["budget_tokens"] = budget
         payload["thinking"] = thinking_obj
 
-    def _apply_non_streaming_cap_from_error(self, payload: Dict[str, object], error_text: str) -> bool:
-        if not self._is_streaming_required_error(error_text):
-            return False
-
-        current = int(payload.get("max_tokens", 0) or 0)
-        if current <= 1024:
-            return False
-
-        parsed_cap = self._extract_max_tokens_limit(error_text)
-        if parsed_cap and parsed_cap < current:
-            cap = parsed_cap
-        elif current > ANTHROPIC_NON_STREAMING_MAX_TOKENS_FALLBACK:
-            cap = ANTHROPIC_NON_STREAMING_MAX_TOKENS_FALLBACK
-        else:
-            cap = max(1024, current // 2)
-
-        if cap >= current:
-            return False
-
-        payload["max_tokens"] = cap
-        self._normalize_thinking_payload(payload)
-        return True
-
     def _apply_token_cap_from_error(self, payload: Dict[str, object], error_text: str) -> bool:
         changed = False
         cap = self._extract_max_tokens_limit(error_text)
         if cap and int(payload.get("max_tokens", 0) or 0) > cap:
             payload["max_tokens"] = cap
-            changed = True
-
-        if self._apply_non_streaming_cap_from_error(payload, error_text):
             changed = True
 
         if self._is_thinking_budget_relation_error(error_text):
@@ -407,8 +401,13 @@ class AnthropicMessagesClient(BaseLLMClient):
 
         return changed
 
-    def _send(self, payload: Dict[str, object]) -> object:
-        self.logger.debug("Using Anthropic non-streaming API. max_tokens=%s", payload.get("max_tokens"))
+    def _send(self, payload: Dict[str, object], force_stream: bool = False) -> object:
+        max_tokens = int(payload.get("max_tokens", 0) or 0)
+        use_stream = force_stream or max_tokens >= ANTHROPIC_STREAMING_MAX_TOKENS_THRESHOLD
+        if use_stream:
+            self.logger.info("Using Anthropic streaming API. max_tokens=%d", max_tokens)
+            with self.client.messages.stream(**payload) as stream:
+                return stream.get_final_message()
         return self.client.messages.create(**payload)
 
     def generate_text(
@@ -421,16 +420,42 @@ class AnthropicMessagesClient(BaseLLMClient):
         thinking_budget_tokens: int,
         enable_extended_thinking: bool,
     ) -> str:
+        max_output_tokens = max(256, int(max_output_tokens))
+        thinking_budget_tokens = max(0, int(thinking_budget_tokens))
+        if thinking_budget_tokens >= max_output_tokens:
+            thinking_budget_tokens = max_output_tokens - 1
+        if 0 < thinking_budget_tokens < 1024:
+            thinking_budget_tokens = 0
+
         payload: Dict[str, object] = {
             "model": self.model,
             "system": system_prompt,
             "messages": [{"role": "user", "content": user_prompt}],
             "max_tokens": max_output_tokens,
         }
-        if enable_extended_thinking and thinking_budget_tokens > 0:
-            payload["thinking"] = {"type": "enabled", "budget_tokens": int(thinking_budget_tokens)}
+        use_thinking = enable_extended_thinking and thinking_budget_tokens > 0
+        if use_thinking:
+            if self._is_opus_4_7_model():
+                payload["thinking"] = {"type": "adaptive"}
+                payload["output_config"] = {"effort": "xhigh"}
+                if temperature != 1.0:
+                    self.logger.warning(
+                        "Ignoring temperature=%s for %s because non-default sampling params are unsupported.",
+                        temperature,
+                        self.model,
+                    )
+            else:
+                payload["thinking"] = {"type": "enabled", "budget_tokens": int(thinking_budget_tokens)}
         else:
-            payload["temperature"] = temperature
+            if self._is_opus_4_7_model():
+                if temperature != 1.0:
+                    self.logger.warning(
+                        "Ignoring temperature=%s for %s because non-default sampling params are unsupported.",
+                        temperature,
+                        self.model,
+                    )
+            else:
+                payload["temperature"] = temperature
 
         try:
             message = self._send(payload)
@@ -438,7 +463,11 @@ class AnthropicMessagesClient(BaseLLMClient):
             recovered = False
             error_text = str(exc)
             if self._apply_token_cap_from_error(payload, error_text):
-                if "thinking" not in payload and "temperature" not in payload:
+                if (
+                    not self._is_opus_4_7_model()
+                    and "thinking" not in payload
+                    and "temperature" not in payload
+                ):
                     payload["temperature"] = temperature
                 self.logger.warning(
                     "Anthropic request rejected by token constraints (%s). Retrying with max_tokens=%s%s.",
@@ -455,15 +484,30 @@ class AnthropicMessagesClient(BaseLLMClient):
 
             if recovered:
                 pass
+            elif self._is_streaming_required_error(str(exc)):
+                try:
+                    message = self._send(payload, force_stream=True)
+                except Exception as stream_exc:  # noqa: BLE001
+                    raise ScriptOnlyError(f"Anthropic API error: {stream_exc}") from stream_exc
             elif "thinking" in payload:
                 payload.pop("thinking", None)
-                payload["temperature"] = temperature
+                if not self._is_opus_4_7_model():
+                    payload["temperature"] = temperature
                 try:
                     message = self._send(payload)
                 except Exception as retry_exc:  # noqa: BLE001
                     retry_text = str(retry_exc)
-                    if self._apply_token_cap_from_error(payload, retry_text):
-                        if "thinking" not in payload and "temperature" not in payload:
+                    if self._is_streaming_required_error(retry_text):
+                        try:
+                            message = self._send(payload, force_stream=True)
+                        except Exception as stream_retry_exc:  # noqa: BLE001
+                            raise ScriptOnlyError(f"Anthropic API error: {stream_retry_exc}") from stream_retry_exc
+                    elif self._apply_token_cap_from_error(payload, retry_text):
+                        if (
+                            not self._is_opus_4_7_model()
+                            and "thinking" not in payload
+                            and "temperature" not in payload
+                        ):
                             payload["temperature"] = temperature
                         self.logger.warning(
                             "Anthropic non-thinking retry also exceeded token limit. Retrying with max_tokens=%s.",
@@ -625,7 +669,7 @@ def run() -> int:
             pdf_path = (root_dir / pdf_path).resolve()
 
         provider = _resolve_provider(args.company)
-        model = args.model
+        model = _normalize_model_for_provider(provider, args.model)
 
         temp_logger = logging.getLogger("script_only_boot")
         temp_logger.setLevel(logging.INFO)
@@ -663,6 +707,12 @@ def run() -> int:
             max_output = int(args.max_output_tokens)
         if args.thinking_budget is not None:
             thinking = int(args.thinking_budget)
+        model_output_cap = int(profile["max_output_tokens"])
+        max_output = max(256, min(int(max_output), model_output_cap))
+        if thinking >= max_output:
+            thinking = max_output - 1
+        if 0 < thinking < 1024:
+            thinking = 0
         if provider != "anthropic":
             thinking = 0
 

@@ -334,9 +334,11 @@ def run() -> int:
         audio_path = synthesize_audio_from_dialogue(
             dialogue_path=dialogue_path,
             api_keys=voice_api_keys,
+            tts_provider="openai",
             tts_model=args.tts_model,
             host_a_voice=args.host_a_voice,
             host_b_voice=args.host_b_voice,
+            tts_language="en",
             output_dir=paper_dir,
             logger=logger,
         )

@@ -18,6 +18,7 @@ from llm_writer import (
     generate_dialogue_file_from_text,
     load_api_keys,
 )
+from emotion import EmotionError, add_emotion_tags_to_dialogue
 from tts_audio import TTSAudioError, synthesize_audio_from_dialogue
 
 # ---------------------------------------------------------------------------
@@ -27,27 +28,43 @@ from tts_audio import TTSAudioError, synthesize_audio_from_dialogue
 # - DETAIL_LEVEL: "Default", "Medium", or "High"
 # - Company: "OpenAI" or "Claude"
 # - Model examples:
-#   - Claude: "claude-3-7-sonnet-latest", "claude-opus-4-6", "claude-sonnet-4-6"
+#   - Claude: "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6"
 #   - OpenAI: "gpt-4o", "gpt-4o-latest"
 # - MODEL_MAX_OUTPUT_TOKENS and THINKING_BUDGET_TOKENS are computed dynamically from context.
 #   You can still override at runtime using CLI flags.
 # - EXTENDED_THINKING_ALWAYS_ON keeps reasoning mode enabled for all runs.
 
-File = "Bayesian_Koopman_Time_Series_Forecasting.pdf"
+File = "Channel Estimation for Reconfigurable Intelligent Surface MIMO with Tensor Signal Modelling.pdf"
 DETAIL_LEVEL = "High"
 Company = "Claude"
-Model = "claude-opus-4-6"
+Model = "claude-opus-4-7"
 API_WRITER_FILE = "apit.txt"
 API_VOICE_FILE = "apiv.txt"
+API_GROK_FILE = "xapi.txt"
 FINAL_ROOT = "Final"
 EXTENDED_THINKING_ALWAYS_ON = True
 
 # TTS settings
-TTS_MODEL = "gpt-4o-mini-tts"
-HOST_A_VOICE = "echo"
-HOST_B_VOICE = "nova"
+TTS_PROVIDER = "grok"  # openai or grok
+TTS_MODEL = "grok-tts"
+TTS_LANGUAGE = "en"
+OPENAI_HOST_A_VOICE = "echo"
+OPENAI_HOST_B_VOICE = "nova"
+GROK_HOST_A_VOICE = "ARA"
+GROK_HOST_B_VOICE = "EVE"
+
+# Emotion middleware settings (used for Grok TTS)
+EMOTION_ENABLED = True
+EMOTION_MODEL = "claude-sonnet-4-6"
+EMOTION_THINKING_BUDGET = 32768
 
 SUPPORTED_MODELS = {
+    "claude-opus-4-7": {
+        "provider": "anthropic",
+        "max_context_tokens": 1_000_000,
+        "max_output_tokens": 128_000,
+        "supports_extended_thinking": True,
+    },
     "claude-3-7-sonnet-latest": {
         "provider": "anthropic",
         "max_context_tokens": 200_000,
@@ -62,8 +79,8 @@ SUPPORTED_MODELS = {
     },
     "claude-sonnet-4-6": {
         "provider": "anthropic",
-        "max_context_tokens": 200_000,
-        "max_output_tokens": 128_000,
+        "max_context_tokens": 1_000_000,
+        "max_output_tokens": 64_000,
         "supports_extended_thinking": True,
     },
     "gpt-4o": {
@@ -94,6 +111,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=Model, help="Writer model id")
     parser.add_argument("--api-writer-file", default=API_WRITER_FILE, help="Path to writer API keys file (apit.txt)")
     parser.add_argument("--api-voice-file", default=API_VOICE_FILE, help="Path to voice API keys file (apiv.txt)")
+    parser.add_argument("--api-grok-file", default=API_GROK_FILE, help="Path to Grok/xAI TTS API keys file (xapi.txt)")
     parser.add_argument("--final-root", default=FINAL_ROOT, help="Master output root folder")
     parser.add_argument("--llm-base-url", default=None, help="Optional OpenAI-compatible base URL")
     parser.add_argument("--temperature", type=float, default=0.7)
@@ -103,9 +121,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-output-tokens", type=int, default=None, help="Manual override")
     parser.add_argument("--thinking-budget", type=int, default=None, help="Manual override")
 
+    parser.add_argument("--tts-provider", default=TTS_PROVIDER, help="TTS provider: OpenAI or Grok/xAI")
     parser.add_argument("--tts-model", default=TTS_MODEL)
-    parser.add_argument("--host-a-voice", default=HOST_A_VOICE)
-    parser.add_argument("--host-b-voice", default=HOST_B_VOICE)
+    parser.add_argument("--tts-language", default=TTS_LANGUAGE, help="BCP-47 language code for Grok TTS, e.g. en or auto")
+    parser.add_argument("--host-a-voice", default=None, help="Host A voice (provider-specific; defaults selected automatically)")
+    parser.add_argument("--host-b-voice", default=None, help="Host B voice (provider-specific; defaults selected automatically)")
+    parser.add_argument("--emotion", action=argparse.BooleanOptionalAction, default=EMOTION_ENABLED)
+    parser.add_argument("--emotion-model", default=EMOTION_MODEL, help="Emotion middleware model (Anthropic)")
+    parser.add_argument("--emotion-thinking-budget", type=int, default=EMOTION_THINKING_BUDGET)
     parser.add_argument("--skip-tts", action="store_true")
     return parser.parse_args()
 
@@ -117,6 +140,15 @@ def _resolve_provider(company: str) -> str:
     if "openai" in value or "gpt" in value or "chatgpt" in value:
         return "openai"
     raise MainError("Company must be OpenAI or Claude.")
+
+
+def _resolve_tts_provider(provider: str) -> str:
+    value = (provider or "").strip().lower()
+    if value in {"openai", "gpt", "chatgpt"}:
+        return "openai"
+    if value in {"grok", "xai", "x.ai"}:
+        return "grok"
+    raise MainError("TTS provider must be OpenAI or Grok.")
 
 
 def _resolve_pdf_path(pdf_value: str, root_dir: Path) -> Path:
@@ -140,6 +172,8 @@ def _normalize_model_for_provider(provider: str, model: str) -> str:
     m = (model or "").strip()
     lowered = m.lower()
     if provider == "anthropic":
+        if lowered in {"opus 4.7", "claude opus 4.7", "claude-opus-4.7"}:
+            return "claude-opus-4-7"
         if lowered in {"opus", "opus 4.6", "claude opus", "claude-opus"}:
             return "claude-opus-4-6"
         if lowered in {"sonnet", "claude sonnet", "claude-sonnet"}:
@@ -235,6 +269,7 @@ def run() -> int:
         pdf_path = _resolve_pdf_path(args.pdf, root_dir)
         api_writer_file = Path(args.api_writer_file).expanduser().resolve()
         api_voice_file = Path(args.api_voice_file).expanduser().resolve()
+        api_grok_file = Path(args.api_grok_file).expanduser().resolve()
         final_root = Path(args.final_root).expanduser()
         if not final_root.is_absolute():
             final_root = (root_dir / final_root).resolve()
@@ -242,6 +277,9 @@ def run() -> int:
 
         provider = _resolve_provider(args.company)
         model = _normalize_model_for_provider(provider, args.model)
+        tts_provider = _resolve_tts_provider(args.tts_provider)
+        host_a_voice = args.host_a_voice or (GROK_HOST_A_VOICE if tts_provider == "grok" else OPENAI_HOST_A_VOICE)
+        host_b_voice = args.host_b_voice or (GROK_HOST_B_VOICE if tts_provider == "grok" else OPENAI_HOST_B_VOICE)
 
         bootstrap_logger = _build_bootstrap_logger()
         title, text = extract_pdf_text(pdf_path, bootstrap_logger)
@@ -261,11 +299,27 @@ def run() -> int:
             logger.info("Copied source PDF to: %s", copied_pdf)
 
         writer_api_keys = load_api_keys(api_writer_file)
-        voice_api_keys = load_api_keys(api_voice_file)
+        selected_voice_api_file = api_grok_file if tts_provider == "grok" else api_voice_file
+        if tts_provider == "grok" and not selected_voice_api_file.exists() and api_voice_file.exists():
+            logger.warning(
+                "Grok API file not found at %s. Falling back to --api-voice-file: %s",
+                selected_voice_api_file,
+                api_voice_file,
+            )
+            selected_voice_api_file = api_voice_file
+        voice_api_keys = load_api_keys(selected_voice_api_file)
         logger.info("Writer API file: %s", api_writer_file)
-        logger.info("Voice API file: %s", api_voice_file)
+        logger.info("Voice API file: %s", selected_voice_api_file)
         logger.info("Loaded writer API services: %s", ", ".join(sorted(writer_api_keys.keys())))
         logger.info("Loaded voice API services: %s", ", ".join(sorted(voice_api_keys.keys())))
+        logger.info(
+            "TTS config: provider=%s model=%s language=%s host_a_voice=%s host_b_voice=%s",
+            tts_provider,
+            args.tts_model,
+            args.tts_language,
+            host_a_voice,
+            host_b_voice,
+        )
 
         profile = _lookup_model_profile(model, provider)
         context_window = int(profile["max_context_tokens"])
@@ -331,19 +385,40 @@ def run() -> int:
             logger.info("Completed. Dialogue file: %s", dialogue_path)
             return 0
 
+        use_emotion_stage = bool(args.emotion)
+        if tts_provider == "grok" and not use_emotion_stage:
+            logger.info("Grok TTS selected; forcing emotion stage ON.")
+            use_emotion_stage = True
+        if tts_provider != "grok" and use_emotion_stage:
+            logger.warning("Emotion stage currently applies only to Grok TTS. Disabling emotion stage.")
+            use_emotion_stage = False
+
+        dialogue_for_tts = dialogue_path
+        if use_emotion_stage:
+            dialogue_for_tts = add_emotion_tags_to_dialogue(
+                dialogue_path=dialogue_path,
+                output_dir=paper_dir,
+                api_keys=writer_api_keys,
+                logger=logger,
+                model=args.emotion_model,
+                thinking_budget_tokens=max(0, int(args.emotion_thinking_budget)),
+            )
+
         audio_path = synthesize_audio_from_dialogue(
-            dialogue_path=dialogue_path,
+            dialogue_path=dialogue_for_tts,
             api_keys=voice_api_keys,
+            tts_provider=tts_provider,
             tts_model=args.tts_model,
-            host_a_voice=args.host_a_voice,
-            host_b_voice=args.host_b_voice,
+            host_a_voice=host_a_voice,
+            host_b_voice=host_b_voice,
+            tts_language=args.tts_language,
             output_dir=paper_dir,
             logger=logger,
         )
         logger.info("Completed. Final audio: %s", audio_path)
         return 0
 
-    except (MainError, LLMWriterError, TTSAudioError, FileNotFoundError, ValueError) as exc:
+    except (MainError, LLMWriterError, EmotionError, TTSAudioError, FileNotFoundError, ValueError) as exc:
         logging.getLogger("paper_suite").exception("Pipeline failed: %s", exc)
         print(f"ERROR: {exc}")
         return 1
